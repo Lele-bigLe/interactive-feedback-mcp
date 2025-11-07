@@ -13,14 +13,19 @@ from typing import Optional, TypedDict
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit, QGroupBox
+    QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit, QGroupBox, QFileDialog
 )
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSettings
-from PySide6.QtGui import QTextCursor, QIcon, QKeyEvent, QFont, QFontDatabase, QPalette, QColor
+from PySide6.QtGui import (
+    QTextCursor, QIcon, QKeyEvent, QFont, QFontDatabase, QPalette, QColor, 
+    QPixmap, QClipboard
+)
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 class FeedbackResult(TypedDict):
     command_logs: str
     interactive_feedback: str
+    image_path: str  # 图片路径或URL
 
 class FeedbackConfig(TypedDict):
     run_command: str
@@ -206,6 +211,109 @@ class FeedbackTextEdit(QTextEdit):
         else:
             super().keyPressEvent(event)
 
+class ImageLabel(QLabel):
+    """支持粘贴和拖放的图片标签"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.image_loaded_callback = None  # 回调函数，用于通知父组件图片已加载
+
+    def set_image_loaded_callback(self, callback):
+        """设置图片加载后的回调函数"""
+        self.image_loaded_callback = callback
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """拖拽进入事件"""
+        if event.mimeData().hasUrls() or event.mimeData().hasImage():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        """拖放事件"""
+        if event.mimeData().hasImage():
+            # 从拖拽中获取图片
+            image_data = event.mimeData().imageData()
+            if image_data:
+                # 转换为QPixmap
+                from PySide6.QtGui import QImage
+                if isinstance(image_data, QImage):
+                    pixmap = QPixmap.fromImage(image_data)
+                elif isinstance(image_data, QPixmap):
+                    pixmap = image_data
+                else:
+                    pixmap = QPixmap()
+                if not pixmap.isNull():
+                    self._load_pixmap(pixmap, "拖放的图片")
+        elif event.mimeData().hasUrls():
+            # 拖放文件
+            urls = event.mimeData().urls()
+            if urls:
+                file_path = urls[0].toLocalFile()
+                if file_path:
+                    self._load_from_file(file_path)
+        event.acceptProposedAction()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """键盘事件：支持 Ctrl+V 粘贴"""
+        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
+            self._paste_from_clipboard()
+        else:
+            super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        """鼠标点击事件：点击后获得焦点，支持粘贴"""
+        self.setFocus()
+        super().mousePressEvent(event)
+
+    def _paste_from_clipboard(self):
+        """从剪贴板粘贴图片"""
+        clipboard = QApplication.clipboard()
+        if clipboard.mimeData().hasImage():
+            pixmap = clipboard.pixmap()
+            if not pixmap.isNull():
+                self._load_pixmap(pixmap, "粘贴的图片")
+        elif clipboard.mimeData().hasUrls():
+            # 剪贴板中有文件路径
+            urls = clipboard.mimeData().urls()
+            if urls:
+                file_path = urls[0].toLocalFile()
+                if file_path and os.path.exists(file_path):
+                    self._load_from_file(file_path)
+
+    def _load_pixmap(self, pixmap: QPixmap, source: str):
+        """加载QPixmap图片"""
+        if not pixmap.isNull():
+            if self.image_loaded_callback:
+                self.image_loaded_callback(pixmap, source)
+            else:
+                # 如果没有回调，直接显示
+                self._update_display(pixmap)
+
+    def _load_from_file(self, file_path: str):
+        """从文件加载图片"""
+        if os.path.exists(file_path):
+            pixmap = QPixmap(file_path)
+            if not pixmap.isNull():
+                if self.image_loaded_callback:
+                    self.image_loaded_callback(pixmap, file_path)
+                else:
+                    self._update_display(pixmap)
+
+    def _update_display(self, pixmap: QPixmap):
+        """更新显示"""
+        label_width = self.width() if self.width() > 0 else 400
+        label_height = self.height() if self.height() > 0 else 300
+        scaled_pixmap = pixmap.scaled(
+            label_width,
+            label_height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.setPixmap(scaled_pixmap)
+        self.setText("")
+
 class LogSignals(QObject):
     append_log = Signal(str)
 
@@ -220,6 +328,8 @@ class FeedbackUI(QMainWindow):
         self.feedback_result = None
         self.log_signals = LogSignals()
         self.log_signals.append_log.connect(self._append_log)
+        self.image_path = ""  # 存储图片路径或URL
+        self.image_pixmap = None  # 存储原始图片
 
         self.setWindowTitle("Interactive Feedback MCP")
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -251,6 +361,7 @@ class FeedbackUI(QMainWindow):
         loaded_run_command = self.settings.value("run_command", "", type=str)
         loaded_execute_auto = self.settings.value("execute_automatically", False, type=bool)
         command_section_visible = self.settings.value("commandSectionVisible", False, type=bool)
+        image_section_visible = self.settings.value("imageSectionVisible", False, type=bool)  # 图片区域可见性
         self.settings.endGroup() # End project-specific group
         
         self.config: FeedbackConfig = {
@@ -263,9 +374,16 @@ class FeedbackUI(QMainWindow):
         # Set command section visibility AFTER _create_ui has created relevant widgets
         self.command_group.setVisible(command_section_visible)
         if command_section_visible:
-            self.toggle_command_button.setText("Hide Command Section")
+            self.toggle_command_button.setText("隐藏命令区域")
         else:
-            self.toggle_command_button.setText("Show Command Section")
+            self.toggle_command_button.setText("显示命令区域")
+        
+        # Set image section visibility AFTER _create_ui has created relevant widgets
+        self.image_group.setVisible(image_section_visible)
+        if image_section_visible:
+            self.toggle_image_button.setText("隐藏图片区域")
+        else:
+            self.toggle_image_button.setText("显示图片区域")
 
         set_dark_title_bar(self, True)
 
@@ -287,17 +405,17 @@ class FeedbackUI(QMainWindow):
         layout = QVBoxLayout(central_widget)
 
         # Toggle Command Section Button
-        self.toggle_command_button = QPushButton("Show Command Section")
+        self.toggle_command_button = QPushButton("显示命令区域")
         self.toggle_command_button.clicked.connect(self._toggle_command_section)
         layout.addWidget(self.toggle_command_button)
 
         # Command section
-        self.command_group = QGroupBox("Command")
+        self.command_group = QGroupBox("命令")
         command_layout = QVBoxLayout(self.command_group)
 
         # Working directory label
         formatted_path = self._format_windows_path(self.project_directory)
-        working_dir_label = QLabel(f"Working directory: {formatted_path}")
+        working_dir_label = QLabel(f"工作目录: {formatted_path}")
         command_layout.addWidget(working_dir_label)
 
         # Command input row
@@ -306,7 +424,7 @@ class FeedbackUI(QMainWindow):
         self.command_entry.setText(self.config["run_command"])
         self.command_entry.returnPressed.connect(self._run_command)
         self.command_entry.textChanged.connect(self._update_config)
-        self.run_button = QPushButton("&Run")
+        self.run_button = QPushButton("运行(&R)")
         self.run_button.clicked.connect(self._run_command)
 
         command_input_layout.addWidget(self.command_entry)
@@ -315,11 +433,11 @@ class FeedbackUI(QMainWindow):
 
         # Auto-execute and save config row
         auto_layout = QHBoxLayout()
-        self.auto_check = QCheckBox("Execute automatically on next run")
+        self.auto_check = QCheckBox("下次运行时自动执行")
         self.auto_check.setChecked(self.config.get("execute_automatically", False))
         self.auto_check.stateChanged.connect(self._update_config)
 
-        save_button = QPushButton("&Save Configuration")
+        save_button = QPushButton("保存配置(&S)")
         save_button.clicked.connect(self._save_config)
 
         auto_layout.addWidget(self.auto_check)
@@ -328,7 +446,7 @@ class FeedbackUI(QMainWindow):
         command_layout.addLayout(auto_layout)
 
         # Console section (now part of command_group)
-        console_group = QGroupBox("Console")
+        console_group = QGroupBox("控制台")
         console_layout_internal = QVBoxLayout(console_group)
         console_group.setMinimumHeight(200)
 
@@ -342,7 +460,7 @@ class FeedbackUI(QMainWindow):
 
         # Clear button
         button_layout = QHBoxLayout()
-        self.clear_button = QPushButton("&Clear")
+        self.clear_button = QPushButton("清除(&C)")
         self.clear_button.clicked.connect(self.clear_logs)
         button_layout.addStretch()
         button_layout.addWidget(self.clear_button)
@@ -354,13 +472,59 @@ class FeedbackUI(QMainWindow):
         layout.addWidget(self.command_group)
 
         # Feedback section with adjusted height
-        self.feedback_group = QGroupBox("Feedback")
+        self.feedback_group = QGroupBox("反馈")
         feedback_layout = QVBoxLayout(self.feedback_group)
 
         # Short description label (from self.prompt)
         self.description_label = QLabel(self.prompt)
         self.description_label.setWordWrap(True)
         feedback_layout.addWidget(self.description_label)
+
+        # Toggle Image Section Button
+        self.toggle_image_button = QPushButton("显示图片区域")
+        self.toggle_image_button.clicked.connect(self._toggle_image_section)
+        feedback_layout.addWidget(self.toggle_image_button)
+
+        # 图片区域
+        self.image_group = QGroupBox("图片（可选）")
+        image_layout = QVBoxLayout(self.image_group)
+        
+        # 图片输入行
+        image_input_layout = QHBoxLayout()
+        self.image_input = QLineEdit()
+        self.image_input.setPlaceholderText("输入图片URL或本地文件路径")
+        self.image_input.textChanged.connect(self._on_image_path_changed)
+        self.image_input.returnPressed.connect(self._load_image)
+        
+        select_image_button = QPushButton("选择文件(&I)")
+        select_image_button.clicked.connect(self._select_image_file)
+        load_image_button = QPushButton("加载(&L)")
+        load_image_button.clicked.connect(self._load_image)
+        paste_image_button = QPushButton("粘贴图片 (Ctrl+V)(&P)")
+        paste_image_button.clicked.connect(self._paste_image)
+        clear_image_button = QPushButton("清除(&X)")
+        clear_image_button.clicked.connect(self._clear_image)
+        
+        image_input_layout.addWidget(self.image_input)
+        image_input_layout.addWidget(select_image_button)
+        image_input_layout.addWidget(load_image_button)
+        image_input_layout.addWidget(paste_image_button)
+        image_input_layout.addWidget(clear_image_button)
+        image_layout.addLayout(image_input_layout)
+        
+        # 图片预览标签（支持粘贴和拖放）
+        self.image_label = ImageLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumHeight(200)
+        self.image_label.setMaximumHeight(400)
+        self.image_label.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
+        self.image_label.setText("点击或拖放图片到这里\n或按 Ctrl+V 粘贴图片")
+        self.image_label.setScaledContents(False)  # 使用手动缩放以保持质量
+        self.image_label.set_image_loaded_callback(self._on_image_loaded)
+        image_layout.addWidget(self.image_label)
+        
+        self.image_group.setVisible(False)  # 默认隐藏
+        feedback_layout.addWidget(self.image_group)
 
         self.feedback_text = FeedbackTextEdit()
         font_metrics = self.feedback_text.fontMetrics()
@@ -369,12 +533,20 @@ class FeedbackUI(QMainWindow):
         padding = self.feedback_text.contentsMargins().top() + self.feedback_text.contentsMargins().bottom() + 5 # 5 is extra vertical padding
         self.feedback_text.setMinimumHeight(5 * row_height + padding)
 
-        self.feedback_text.setPlaceholderText("Enter your feedback here (Ctrl+Enter to submit)")
-        submit_button = QPushButton("&Send Feedback (Ctrl+Enter)")
+        self.feedback_text.setPlaceholderText("在此输入您的反馈（Ctrl+Enter 提交）")
+        
+        # 按钮布局：发送反馈和结束按钮
+        button_layout = QHBoxLayout()
+        submit_button = QPushButton("发送反馈 (Ctrl+Enter)(&S)")
         submit_button.clicked.connect(self._submit_feedback)
+        end_button = QPushButton("结束(&E)")
+        end_button.clicked.connect(self._end_feedback)
+        
+        button_layout.addWidget(submit_button)
+        button_layout.addWidget(end_button)
 
         feedback_layout.addWidget(self.feedback_text)
-        feedback_layout.addWidget(submit_button)
+        feedback_layout.addLayout(button_layout)
 
         # Set minimum height for feedback_group to accommodate its contents
         # This will be based on the description label and the 5-line feedback_text
@@ -384,7 +556,7 @@ class FeedbackUI(QMainWindow):
         layout.addWidget(self.feedback_group)
 
         # Credits/Contact Label
-        contact_label = QLabel('Need to improve? Contact Fábio Ferreira on <a href="https://x.com/fabiomlferreira">X.com</a> or visit <a href="https://dotcursorrules.com/">dotcursorrules.com</a>')
+        contact_label = QLabel('需要改进？联系 Fábio Ferreira <a href="https://x.com/fabiomlferreira">X.com</a> 或访问 <a href="https://dotcursorrules.com/">dotcursorrules.com</a>')
         contact_label.setOpenExternalLinks(True)
         contact_label.setAlignment(Qt.AlignCenter)
         # Optionally, make font a bit smaller and less prominent
@@ -398,9 +570,9 @@ class FeedbackUI(QMainWindow):
         is_visible = self.command_group.isVisible()
         self.command_group.setVisible(not is_visible)
         if not is_visible:
-            self.toggle_command_button.setText("Hide Command Section")
+            self.toggle_command_button.setText("隐藏命令区域")
         else:
-            self.toggle_command_button.setText("Show Command Section")
+            self.toggle_command_button.setText("显示命令区域")
         
         # Immediately save the visibility state for this project
         self.settings.beginGroup(self.project_group_name)
@@ -413,6 +585,30 @@ class FeedbackUI(QMainWindow):
              # if command group became visible and has content, ensure enough height
              min_content_height = self.command_group.layout().sizeHint().height() + self.feedback_group.minimumHeight() + self.toggle_command_button.height() + layout().spacing() * 2
              new_height = max(new_height, min_content_height)
+
+        current_width = self.width()
+        self.resize(current_width, new_height)
+
+    def _toggle_image_section(self):
+        """切换图片区域的显示/隐藏"""
+        is_visible = self.image_group.isVisible()
+        self.image_group.setVisible(not is_visible)
+        if not is_visible:
+            self.toggle_image_button.setText("隐藏图片区域")
+        else:
+            self.toggle_image_button.setText("显示图片区域")
+        
+        # 立即保存该项目的可见性状态
+        self.settings.beginGroup(self.project_group_name)
+        self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
+        self.settings.endGroup()
+
+        # 调整窗口高度
+        new_height = self.centralWidget().sizeHint().height()
+        if self.image_group.isVisible() and self.image_group.layout().sizeHint().height() > 0:
+            # 如果图片区域变为可见且有内容，确保有足够的高度
+            min_content_height = self.image_group.layout().sizeHint().height() + self.feedback_group.minimumHeight()
+            new_height = max(new_height, min_content_height)
 
         current_width = self.width()
         self.resize(current_width, new_height)
@@ -432,8 +628,8 @@ class FeedbackUI(QMainWindow):
         if self.process and self.process.poll() is not None:
             # Process has terminated
             exit_code = self.process.poll()
-            self._append_log(f"\nProcess exited with code {exit_code}\n")
-            self.run_button.setText("&Run")
+            self._append_log(f"\n进程已退出，退出码: {exit_code}\n")
+            self.run_button.setText("运行(&R)")
             self.process = None
             self.activateWindow()
             self.feedback_text.setFocus()
@@ -442,7 +638,7 @@ class FeedbackUI(QMainWindow):
         if self.process:
             kill_tree(self.process)
             self.process = None
-            self.run_button.setText("&Run")
+            self.run_button.setText("运行(&R)")
             return
 
         # Clear the log buffer but keep UI logs visible
@@ -450,11 +646,11 @@ class FeedbackUI(QMainWindow):
 
         command = self.command_entry.text()
         if not command:
-            self._append_log("Please enter a command to run\n")
+            self._append_log("请输入要运行的命令\n")
             return
 
         self._append_log(f"$ {command}\n")
-        self.run_button.setText("Sto&p")
+        self.run_button.setText("停止(&P)")
 
         try:
             self.process = subprocess.Popen(
@@ -493,15 +689,123 @@ class FeedbackUI(QMainWindow):
             self.status_timer.start(100)  # Check every 100ms
 
         except Exception as e:
-            self._append_log(f"Error running command: {str(e)}\n")
-            self.run_button.setText("&Run")
+            self._append_log(f"运行命令时出错: {str(e)}\n")
+            self.run_button.setText("运行(&R)")
 
     def _submit_feedback(self):
+        feedback_text = self.feedback_text.toPlainText().strip()
+        # 如果有图片，在反馈文本中添加图片信息
+        if self.image_path:
+            if feedback_text:
+                feedback_text += f"\n\n[图片: {self.image_path}]"
+            else:
+                feedback_text = f"[图片: {self.image_path}]"
+        
         self.feedback_result = FeedbackResult(
             logs="".join(self.log_buffer),
-            interactive_feedback=self.feedback_text.toPlainText().strip(),
+            interactive_feedback=feedback_text,
+            image_path=self.image_path,
         )
         self.close()
+
+    def _end_feedback(self):
+        # 自动填入"结束"并提交反馈
+        self.feedback_text.setPlainText("结束")
+        self._submit_feedback()
+
+    def _select_image_file(self):
+        # 选择本地图片文件
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片文件",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
+        )
+        if file_path:
+            self.image_input.setText(file_path)
+            self._load_image()
+
+    def _load_image(self):
+        # 加载图片（从URL或本地路径）
+        path = self.image_input.text().strip()
+        if not path:
+            return
+        
+        self.image_path = path
+        
+        # 判断是URL还是本地路径
+        if path.startswith(("http://", "https://")):
+            # URL图片 - 使用网络请求加载（简化版，实际可能需要异步加载）
+            self.image_label.setText(f"URL图片: {path}\n(预览需要网络连接)")
+            self.image_label.setStyleSheet("border: 1px solid #666; background-color: #2a2a2a; color: #fff;")
+        else:
+            # 本地文件路径
+            if os.path.exists(path):
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    # 保存原始图片
+                    self.image_pixmap = pixmap
+                    # 更新显示
+                    self._update_image_display()
+                else:
+                    self.image_pixmap = None
+                    self.image_label.setText("无法加载图片文件")
+                    self.image_label.setStyleSheet("border: 1px solid #f00; background-color: #2a2a2a; color: #f00;")
+            else:
+                self.image_pixmap = None
+                self.image_label.setText(f"文件不存在: {path}")
+                self.image_label.setStyleSheet("border: 1px solid #f00; background-color: #2a2a2a; color: #f00;")
+
+    def _paste_image(self):
+        """粘贴图片按钮处理"""
+        self.image_label._paste_from_clipboard()
+
+    def _on_image_loaded(self, pixmap: QPixmap, source: str):
+        """图片加载回调函数"""
+        if not pixmap.isNull():
+            # 保存原始图片
+            self.image_pixmap = pixmap
+            # 设置图片路径
+            if source and os.path.exists(source):
+                self.image_path = source
+                self.image_input.setText(source)
+            else:
+                # 如果是粘贴的图片，保存为临时文件或标记为粘贴
+                self.image_path = f"[粘贴的图片]"
+                self.image_input.setText("[粘贴的图片]")
+            # 更新显示
+            self._update_image_display()
+            # 更新样式
+            self.image_label.setStyleSheet("border: 2px solid #42a2da; background-color: #2a2a2a;")
+
+    def _clear_image(self):
+        # 清除图片
+        self.image_input.clear()
+        self.image_path = ""
+        self.image_pixmap = None
+        self.image_label.clear()
+        self.image_label.setText("点击或拖放图片到这里\n或按 Ctrl+V 粘贴图片")
+        self.image_label.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
+
+    def _update_image_display(self):
+        # 更新图片显示（当窗口大小改变时调用）
+        if self.image_pixmap and not self.image_pixmap.isNull():
+            # 获取显示区域尺寸，如果为0则使用默认值
+            label_width = self.image_label.width() if self.image_label.width() > 0 else 400
+            label_height = self.image_label.height() if self.image_label.height() > 0 else 300
+            # 缩放图片以适应显示区域
+            scaled_pixmap = self.image_pixmap.scaled(
+                label_width,
+                label_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled_pixmap)
+            self.image_label.setText("")
+
+    def _on_image_path_changed(self, text: str):
+        # 当图片路径输入框内容改变时的处理
+        pass
 
     def clear_logs(self):
         self.log_buffer = []
@@ -513,7 +817,13 @@ class FeedbackUI(QMainWindow):
         self.settings.setValue("run_command", self.config["run_command"])
         self.settings.setValue("execute_automatically", self.config["execute_automatically"])
         self.settings.endGroup()
-        self._append_log("Configuration saved for this project.\n")
+        self._append_log("已保存该项目的配置。\n")
+
+    def resizeEvent(self, event):
+        # 窗口大小改变时，更新图片显示
+        super().resizeEvent(event)
+        if self.image_pixmap:
+            self._update_image_display()
 
     def closeEvent(self, event):
         # Save general UI settings for the main window (geometry, state)
@@ -525,6 +835,7 @@ class FeedbackUI(QMainWindow):
         # Save project-specific command section visibility (this is now slightly redundant due to immediate save in toggle, but harmless)
         self.settings.beginGroup(self.project_group_name)
         self.settings.setValue("commandSectionVisible", self.command_group.isVisible())
+        self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
         self.settings.endGroup()
 
         if self.process:
@@ -539,7 +850,7 @@ class FeedbackUI(QMainWindow):
             kill_tree(self.process)
 
         if not self.feedback_result:
-            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="")
+            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="")
 
         return self.feedback_result
 
@@ -568,14 +879,14 @@ def feedback_ui(project_directory: str, prompt: str, output_file: Optional[str] 
     return result
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the feedback UI")
-    parser.add_argument("--project-directory", default=os.getcwd(), help="The project directory to run the command in")
-    parser.add_argument("--prompt", default="I implemented the changes you requested.", help="The prompt to show to the user")
-    parser.add_argument("--output-file", help="Path to save the feedback result as JSON")
+    parser = argparse.ArgumentParser(description="运行反馈界面")
+    parser.add_argument("--project-directory", default=os.getcwd(), help="运行命令的项目目录")
+    parser.add_argument("--prompt", default="我已经实现了您请求的更改。", help="显示给用户的提示")
+    parser.add_argument("--output-file", help="保存反馈结果为 JSON 的路径")
     args = parser.parse_args()
 
     result = feedback_ui(args.project_directory, args.prompt, args.output_file)
     if result:
-        print(f"\nLogs collected: \n{result['logs']}")
-        print(f"\nFeedback received:\n{result['interactive_feedback']}")
+        print(f"\n收集的日志: \n{result['logs']}")
+        print(f"\n收到的反馈:\n{result['interactive_feedback']}")
     sys.exit(0)
