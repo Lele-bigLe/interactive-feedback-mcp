@@ -436,23 +436,23 @@ class FeedbackUI(QMainWindow):
         # Set command section visibility AFTER _create_ui has created relevant widgets
         self.command_group.setVisible(command_section_visible)
         if command_section_visible:
-            self.toggle_command_button.setText("隐藏命令区域")
+            self.toggle_command_button.setText("➖ 隐藏命令区域")
         else:
-            self.toggle_command_button.setText("显示命令区域")
+            self.toggle_command_button.setText("📂 显示命令区域")
         
         # Set image section visibility AFTER _create_ui has created relevant widgets
         self.image_group.setVisible(image_section_visible)
         if image_section_visible:
-            self.toggle_image_button.setText("隐藏图片区域")
+            self.toggle_image_button.setText("➖ 图片")
         else:
-            self.toggle_image_button.setText("显示图片区域")
+            self.toggle_image_button.setText("🖼️ 图片")
         
         # Set context section visibility AFTER _create_ui has created relevant widgets
         self.context_group.setVisible(context_section_visible)
         if context_section_visible:
-            self.toggle_context_button.setText("隐藏上下文引用")
+            self.toggle_context_button.setText("➖ 上下文引用")
         else:
-            self.toggle_context_button.setText("显示上下文引用")
+            self.toggle_context_button.setText("📎 上下文引用")
 
         set_dark_title_bar(self, True)
 
@@ -468,13 +468,149 @@ class FeedbackUI(QMainWindow):
                 path = path[0].upper() + path[1:]
         return path
 
+    def _apply_styles(self):
+        """应用全局样式表"""
+        style = """
+            /* 主按钮样式 */
+            QPushButton {
+                background-color: #3d3d3d;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 8px 16px;
+                color: #fff;
+                font-size: 13px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                border-color: #666;
+            }
+            QPushButton:pressed {
+                background-color: #2d2d2d;
+            }
+            
+            /* 切换按钮特殊样式 */
+            QPushButton#toggleButton {
+                background-color: #2a4a6a;
+                border: 1px solid #3a5a7a;
+                text-align: left;
+                padding-left: 12px;
+            }
+            QPushButton#toggleButton:hover {
+                background-color: #3a5a8a;
+            }
+            
+            /* 主要操作按钮 */
+            QPushButton#primaryButton {
+                background-color: #2a82da;
+                border: 1px solid #3a92ea;
+            }
+            QPushButton#primaryButton:hover {
+                background-color: #3a92ea;
+            }
+            
+            /* 危险操作按钮 */
+            QPushButton#dangerButton {
+                background-color: #8a3a3a;
+                border: 1px solid #9a4a4a;
+            }
+            QPushButton#dangerButton:hover {
+                background-color: #9a4a4a;
+            }
+            
+            /* 分组框样式 */
+            QGroupBox {
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #555;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+                background-color: #323232;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 8px;
+                color: #aaa;
+            }
+            
+            /* 输入框样式 */
+            QLineEdit {
+                background-color: #3a3a3a;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 8px 12px;
+                color: #fff;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border-color: #2a82da;
+            }
+            QLineEdit::placeholder {
+                color: #888;
+            }
+            
+            /* 文本编辑器样式 */
+            QTextEdit {
+                background-color: #2a2a2a;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 8px;
+                color: #fff;
+                font-size: 13px;
+            }
+            QTextEdit:focus {
+                border-color: #2a82da;
+            }
+            
+            /* 复选框样式 */
+            QCheckBox {
+                color: #ccc;
+                font-size: 13px;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #555;
+                background-color: #3a3a3a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #2a82da;
+                border-color: #2a82da;
+            }
+            
+            /* 标签样式 */
+            QLabel {
+                color: #ddd;
+                font-size: 13px;
+            }
+            QLabel#descriptionLabel {
+                font-size: 14px;
+                color: #fff;
+                padding: 8px;
+                background-color: #3a4a5a;
+                border-radius: 6px;
+                border-left: 4px solid #2a82da;
+            }
+        """
+        self.setStyleSheet(style)
+
     def _create_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
+        layout.setSpacing(12)  # 增加组件间距
+        layout.setContentsMargins(16, 16, 16, 16)  # 增加边距
+
+        # 全局样式表
+        self._apply_styles()
 
         # Toggle Command Section Button
-        self.toggle_command_button = QPushButton("显示命令区域")
+        self.toggle_command_button = QPushButton("📂 显示命令区域")
+        self.toggle_command_button.setObjectName("toggleButton")
         self.toggle_command_button.clicked.connect(self._toggle_command_section)
         layout.addWidget(self.toggle_command_button)
 
@@ -541,42 +677,60 @@ class FeedbackUI(QMainWindow):
         layout.addWidget(self.command_group)
 
         # Feedback section with adjusted height
-        self.feedback_group = QGroupBox("反馈")
+        self.feedback_group = QGroupBox("💬 反馈")
         feedback_layout = QVBoxLayout(self.feedback_group)
+        feedback_layout.setSpacing(10)
 
         # Short description label (from self.prompt)
         self.description_label = QLabel(self.prompt)
         self.description_label.setWordWrap(True)
+        self.description_label.setObjectName("descriptionLabel")
         feedback_layout.addWidget(self.description_label)
 
+        # 可选区域按钮行（水平排列）
+        toggle_layout = QHBoxLayout()
+        toggle_layout.setSpacing(8)
+        
         # Toggle Image Section Button
-        self.toggle_image_button = QPushButton("显示图片区域")
+        self.toggle_image_button = QPushButton("🖼️ 图片")
+        self.toggle_image_button.setObjectName("toggleButton")
         self.toggle_image_button.clicked.connect(self._toggle_image_section)
-        feedback_layout.addWidget(self.toggle_image_button)
+        toggle_layout.addWidget(self.toggle_image_button)
+        
+        # Toggle Context Section Button
+        self.toggle_context_button = QPushButton("📎 上下文引用")
+        self.toggle_context_button.setObjectName("toggleButton")
+        self.toggle_context_button.clicked.connect(self._toggle_context_section)
+        toggle_layout.addWidget(self.toggle_context_button)
+        
+        toggle_layout.addStretch()
+        feedback_layout.addLayout(toggle_layout)
 
         # 图片区域
-        self.image_group = QGroupBox("图片（可选）")
+        self.image_group = QGroupBox("🖼️ 图片（可选）")
         image_layout = QVBoxLayout(self.image_group)
+        image_layout.setSpacing(8)
         
         # 图片输入行
         image_input_layout = QHBoxLayout()
+        image_input_layout.setSpacing(6)
         self.image_input = QLineEdit()
-        self.image_input.setPlaceholderText("输入图片URL或本地文件路径")
+        self.image_input.setPlaceholderText("输入图片URL或本地文件路径...")
         self.image_input.textChanged.connect(self._on_image_path_changed)
         self.image_input.returnPressed.connect(self._load_image)
         
-        select_image_button = QPushButton("选择文件(&I)")
+        select_image_button = QPushButton("📂 选择")
         select_image_button.clicked.connect(self._select_image_file)
-        load_image_button = QPushButton("加载(&L)")
-        load_image_button.clicked.connect(self._load_image)
-        paste_image_button = QPushButton("粘贴图片 (Ctrl+V)(&P)")
+        paste_image_button = QPushButton("📋 粘贴")
+        paste_image_button.setObjectName("primaryButton")
         paste_image_button.clicked.connect(self._paste_image)
-        clear_image_button = QPushButton("清除(&X)")
+        clear_image_button = QPushButton("🗑️")
+        clear_image_button.setObjectName("dangerButton")
+        clear_image_button.setFixedWidth(40)
         clear_image_button.clicked.connect(self._clear_image)
         
-        image_input_layout.addWidget(self.image_input)
+        image_input_layout.addWidget(self.image_input, 1)
         image_input_layout.addWidget(select_image_button)
-        image_input_layout.addWidget(load_image_button)
         image_input_layout.addWidget(paste_image_button)
         image_input_layout.addWidget(clear_image_button)
         image_layout.addLayout(image_input_layout)
@@ -584,32 +738,38 @@ class FeedbackUI(QMainWindow):
         # 图片预览标签（支持粘贴和拖放）
         self.image_label = ImageLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumHeight(200)
-        self.image_label.setMaximumHeight(400)
-        self.image_label.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
-        self.image_label.setText("点击或拖放图片到这里\n或按 Ctrl+V 粘贴图片")
-        self.image_label.setScaledContents(False)  # 使用手动缩放以保持质量
+        self.image_label.setMinimumHeight(150)
+        self.image_label.setMaximumHeight(300)
+        self.image_label.setStyleSheet("""
+            border: 2px dashed #555; 
+            border-radius: 8px;
+            background-color: #2a2a2a; 
+            color: #888;
+            font-size: 13px;
+        """)
+        self.image_label.setText("🖼️ 拖放图片到这里\n或按 Ctrl+V 粘贴")
+        self.image_label.setScaledContents(False)
         self.image_label.set_image_loaded_callback(self._on_image_loaded)
         image_layout.addWidget(self.image_label)
         
-        self.image_group.setVisible(False)  # 默认隐藏
+        self.image_group.setVisible(False)
         feedback_layout.addWidget(self.image_group)
 
         # 上下文文件区域
-        self.toggle_context_button = QPushButton("显示上下文引用")
-        self.toggle_context_button.clicked.connect(self._toggle_context_section)
-        feedback_layout.addWidget(self.toggle_context_button)
-        
-        self.context_group = QGroupBox("上下文引用（可选）")
+        self.context_group = QGroupBox("📎 上下文引用（可选）")
         context_layout = QVBoxLayout(self.context_group)
+        context_layout.setSpacing(8)
         
         # 上下文文件操作按钮行
         context_btn_layout = QHBoxLayout()
-        add_file_button = QPushButton("添加文件(&F)")
+        context_btn_layout.setSpacing(6)
+        add_file_button = QPushButton("📄 添加文件")
         add_file_button.clicked.connect(self._add_context_file)
-        add_folder_button = QPushButton("添加文件夹(&D)")
+        add_folder_button = QPushButton("📁 添加文件夹")
         add_folder_button.clicked.connect(self._add_context_folder)
-        clear_context_button = QPushButton("清除全部(&C)")
+        clear_context_button = QPushButton("🗑️")
+        clear_context_button.setObjectName("dangerButton")
+        clear_context_button.setFixedWidth(40)
         clear_context_button.clicked.connect(self._clear_context_files)
         
         context_btn_layout.addWidget(add_file_button)
@@ -620,63 +780,66 @@ class FeedbackUI(QMainWindow):
         
         # 上下文文件列表（支持拖放）
         self.context_list = ContextFileList()
-        self.context_list.setMinimumHeight(100)
-        self.context_list.setMaximumHeight(200)
-        self.context_list.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
-        self.context_list.setPlaceholderText("拖放文件/文件夹到这里，或使用上方按钮添加\n支持多选")
+        self.context_list.setMinimumHeight(80)
+        self.context_list.setMaximumHeight(150)
+        self.context_list.setStyleSheet("""
+            border: 2px dashed #555; 
+            border-radius: 8px;
+            background-color: #2a2a2a; 
+            color: #888;
+            font-size: 13px;
+            padding: 8px;
+        """)
+        self.context_list.setPlaceholderText("📂 拖放文件/文件夹到这里\n或使用上方按钮添加")
         self.context_list.files_added_callback = self._on_context_files_added
         context_layout.addWidget(self.context_list)
         
-        self.context_group.setVisible(False)  # 默认隐藏
+        self.context_group.setVisible(False)
         feedback_layout.addWidget(self.context_group)
 
+        # 反馈文本输入区
         self.feedback_text = FeedbackTextEdit()
         font_metrics = self.feedback_text.fontMetrics()
         row_height = font_metrics.height()
-        # Calculate height for 5 lines + some padding for margins
-        padding = self.feedback_text.contentsMargins().top() + self.feedback_text.contentsMargins().bottom() + 5 # 5 is extra vertical padding
+        padding = self.feedback_text.contentsMargins().top() + self.feedback_text.contentsMargins().bottom() + 5
         self.feedback_text.setMinimumHeight(5 * row_height + padding)
-
-        self.feedback_text.setPlaceholderText("在此输入您的反馈（Ctrl+Enter 提交）")
+        self.feedback_text.setPlaceholderText("✏️ 在此输入您的反馈...\n\n快捷键: Ctrl+Enter 发送")
+        feedback_layout.addWidget(self.feedback_text)
         
         # 按钮布局：发送反馈和结束按钮
         button_layout = QHBoxLayout()
-        submit_button = QPushButton("发送反馈 (Ctrl+Enter)(&S)")
+        button_layout.setSpacing(10)
+        
+        submit_button = QPushButton("✉️ 发送反馈 (Ctrl+Enter)")
+        submit_button.setObjectName("primaryButton")
         submit_button.clicked.connect(self._submit_feedback)
-        end_button = QPushButton("结束(&E)")
+        
+        end_button = QPushButton("✓ 结束")
         end_button.clicked.connect(self._end_feedback)
         
-        button_layout.addWidget(submit_button)
+        button_layout.addStretch()
         button_layout.addWidget(end_button)
+        button_layout.addWidget(submit_button)
 
-        feedback_layout.addWidget(self.feedback_text)
         feedback_layout.addLayout(button_layout)
-
-        # Set minimum height for feedback_group to accommodate its contents
-        # This will be based on the description label and the 5-line feedback_text
-        self.feedback_group.setMinimumHeight(self.description_label.sizeHint().height() + self.feedback_text.minimumHeight() + submit_button.sizeHint().height() + feedback_layout.spacing() * 2 + feedback_layout.contentsMargins().top() + feedback_layout.contentsMargins().bottom() + 10) # 10 for extra padding
 
         # Add widgets in a specific order
         layout.addWidget(self.feedback_group)
 
         # Credits/Contact Label
-        contact_label = QLabel('需要改进？联系 Fábio Ferreira <a href="https://x.com/fabiomlferreira">X.com</a> 或访问 <a href="https://dotcursorrules.com/">dotcursorrules.com</a>')
+        contact_label = QLabel('💡 需要改进？联系 Fábio Ferreira <a href="https://x.com/fabiomlferreira">X.com</a> 或访问 <a href="https://dotcursorrules.com/">dotcursorrules.com</a>')
         contact_label.setOpenExternalLinks(True)
         contact_label.setAlignment(Qt.AlignCenter)
-        # Optionally, make font a bit smaller and less prominent
-        # contact_label_font = contact_label.font()
-        # contact_label_font.setPointSize(contact_label_font.pointSize() - 1)
-        # contact_label.setFont(contact_label_font)
-        contact_label.setStyleSheet("font-size: 9pt; color: #cccccc;") # Light gray for dark theme
+        contact_label.setStyleSheet("font-size: 10px; color: #666; padding: 8px;")
         layout.addWidget(contact_label)
 
     def _toggle_command_section(self):
         is_visible = self.command_group.isVisible()
         self.command_group.setVisible(not is_visible)
         if not is_visible:
-            self.toggle_command_button.setText("隐藏命令区域")
+            self.toggle_command_button.setText("➖ 隐藏命令区域")
         else:
-            self.toggle_command_button.setText("显示命令区域")
+            self.toggle_command_button.setText("📂 显示命令区域")
         
         # Immediately save the visibility state for this project
         self.settings.beginGroup(self.project_group_name)
@@ -698,9 +861,9 @@ class FeedbackUI(QMainWindow):
         is_visible = self.image_group.isVisible()
         self.image_group.setVisible(not is_visible)
         if not is_visible:
-            self.toggle_image_button.setText("隐藏图片区域")
+            self.toggle_image_button.setText("➖ 图片")
         else:
-            self.toggle_image_button.setText("显示图片区域")
+            self.toggle_image_button.setText("🖼️ 图片")
         
         # 立即保存该项目的可见性状态
         self.settings.beginGroup(self.project_group_name)
@@ -722,9 +885,9 @@ class FeedbackUI(QMainWindow):
         is_visible = self.context_group.isVisible()
         self.context_group.setVisible(not is_visible)
         if not is_visible:
-            self.toggle_context_button.setText("隐藏上下文引用")
+            self.toggle_context_button.setText("➖ 上下文引用")
         else:
-            self.toggle_context_button.setText("显示上下文引用")
+            self.toggle_context_button.setText("📎 上下文引用")
         
         # 立即保存该项目的可见性状态
         self.settings.beginGroup(self.project_group_name)
