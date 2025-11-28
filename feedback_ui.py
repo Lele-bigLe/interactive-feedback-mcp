@@ -1156,7 +1156,7 @@ class FeedbackUI(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "选择图片文件（可多选）",
-            "",
+            self.project_directory,
             "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
         )
         for file_path in files:
