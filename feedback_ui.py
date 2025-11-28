@@ -834,15 +834,15 @@ class FeedbackUI(QMainWindow):
         layout.addWidget(contact_label)
 
     def _adjust_window_height(self):
-        """调整窗口高度以适应内容变化"""
+        """调整窗口高度以适应内容变化（保持宽度不变）"""
+        # 保存当前宽度
+        current_width = self.width()
+        
         # 先处理布局更新
         self.centralWidget().updateGeometry()
         QApplication.processEvents()
         
-        # 计算所需的最小高度
-        current_width = self.width()
-        
-        # 使用 sizeHint 获取建议高度，但要确保隐藏的组件不被计算
+        # 使用 sizeHint 获取建议高度
         hint_height = self.centralWidget().sizeHint().height()
         
         # 设置窗口的最小和最大高度限制
@@ -852,11 +852,13 @@ class FeedbackUI(QMainWindow):
         # 计算新高度
         new_height = max(min_height, min(hint_height, max_height))
         
-        # 调整窗口大小
+        # 设置固定宽度，只调整高度
+        self.setFixedWidth(current_width)
         self.resize(current_width, new_height)
         
-        # 强制更新布局
-        self.centralWidget().adjustSize()
+        # 恢复宽度可调整
+        self.setMinimumWidth(400)
+        self.setMaximumWidth(16777215)  # Qt 默认最大值
 
     def _toggle_command_section(self):
         is_visible = self.command_group.isVisible()
