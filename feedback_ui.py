@@ -833,6 +833,31 @@ class FeedbackUI(QMainWindow):
         contact_label.setStyleSheet("font-size: 10px; color: #666; padding: 8px;")
         layout.addWidget(contact_label)
 
+    def _adjust_window_height(self):
+        """调整窗口高度以适应内容变化"""
+        # 先处理布局更新
+        self.centralWidget().updateGeometry()
+        QApplication.processEvents()
+        
+        # 计算所需的最小高度
+        current_width = self.width()
+        
+        # 使用 sizeHint 获取建议高度，但要确保隐藏的组件不被计算
+        hint_height = self.centralWidget().sizeHint().height()
+        
+        # 设置窗口的最小和最大高度限制
+        min_height = 300  # 最小高度
+        max_height = QApplication.primaryScreen().geometry().height() - 100  # 留出任务栏空间
+        
+        # 计算新高度
+        new_height = max(min_height, min(hint_height, max_height))
+        
+        # 调整窗口大小
+        self.resize(current_width, new_height)
+        
+        # 强制更新布局
+        self.centralWidget().adjustSize()
+
     def _toggle_command_section(self):
         is_visible = self.command_group.isVisible()
         self.command_group.setVisible(not is_visible)
@@ -846,15 +871,8 @@ class FeedbackUI(QMainWindow):
         self.settings.setValue("commandSectionVisible", self.command_group.isVisible())
         self.settings.endGroup()
 
-        # Adjust window height only
-        new_height = self.centralWidget().sizeHint().height()
-        if self.command_group.isVisible() and self.command_group.layout().sizeHint().height() > 0 :
-             # if command group became visible and has content, ensure enough height
-             min_content_height = self.command_group.layout().sizeHint().height() + self.feedback_group.minimumHeight() + self.toggle_command_button.height() + layout().spacing() * 2
-             new_height = max(new_height, min_content_height)
-
-        current_width = self.width()
-        self.resize(current_width, new_height)
+        # 调整窗口高度
+        self._adjust_window_height()
 
     def _toggle_image_section(self):
         """切换图片区域的显示/隐藏"""
@@ -871,14 +889,7 @@ class FeedbackUI(QMainWindow):
         self.settings.endGroup()
 
         # 调整窗口高度
-        new_height = self.centralWidget().sizeHint().height()
-        if self.image_group.isVisible() and self.image_group.layout().sizeHint().height() > 0:
-            # 如果图片区域变为可见且有内容，确保有足够的高度
-            min_content_height = self.image_group.layout().sizeHint().height() + self.feedback_group.minimumHeight()
-            new_height = max(new_height, min_content_height)
-
-        current_width = self.width()
-        self.resize(current_width, new_height)
+        self._adjust_window_height()
 
     def _toggle_context_section(self):
         """切换上下文引用区域的显示/隐藏"""
@@ -895,13 +906,7 @@ class FeedbackUI(QMainWindow):
         self.settings.endGroup()
 
         # 调整窗口高度
-        new_height = self.centralWidget().sizeHint().height()
-        if self.context_group.isVisible() and self.context_group.layout().sizeHint().height() > 0:
-            min_content_height = self.context_group.layout().sizeHint().height() + self.feedback_group.minimumHeight()
-            new_height = max(new_height, min_content_height)
-
-        current_width = self.width()
-        self.resize(current_width, new_height)
+        self._adjust_window_height()
 
     def _add_context_file(self):
         """添加上下文文件"""
