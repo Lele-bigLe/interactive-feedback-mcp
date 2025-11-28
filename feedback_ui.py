@@ -9,7 +9,8 @@ import argparse
 import subprocess
 import threading
 import hashlib
-from typing import Optional, TypedDict
+import tempfile
+from typing import Optional, TypedDict, List
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,6 +27,7 @@ class FeedbackResult(TypedDict):
     command_logs: str
     interactive_feedback: str
     image_path: str  # 图片路径或URL
+    context_files: List[str]  # 上下文文件路径列表
 
 class FeedbackConfig(TypedDict):
     run_command: str
@@ -197,8 +199,20 @@ def get_user_environment() -> dict[str, str]:
         CloseHandle(token)
 
 class FeedbackTextEdit(QTextEdit):
+    """自定义文本编辑器，只接受纯文本粘贴"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        # 设置为纯文本模式
+        self.setAcceptRichText(False)
+
+    def insertFromMimeData(self, source):
+        """重写粘贴方法，只接受纯文本"""
+        if source.hasText():
+            # 只插入纯文本，忽略任何格式
+            self.insertPlainText(source.text())
+        else:
+            # 如果没有文本，调用父类方法
+            super().insertFromMimeData(source)
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
@@ -314,6 +328,51 @@ class ImageLabel(QLabel):
         self.setPixmap(scaled_pixmap)
         self.setText("")
 
+class ContextFileList(QTextEdit):
+    """支持拖放的上下文文件列表"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setReadOnly(True)
+        self.files: List[str] = []
+        self.files_added_callback = None  # 文件添加回调
+        self.setPlaceholderText("拖放文件/文件夹到这里")
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """拖拽进入事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dropEvent(self, event: QDropEvent):
+        """拖放事件"""
+        if event.mimeData().hasUrls():
+            new_files = []
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path and os.path.exists(file_path):
+                    # 如果是文件夹，获取其中所有文件
+                    if os.path.isdir(file_path):
+                        new_files.append(file_path)
+                    else:
+                        new_files.append(file_path)
+            
+            if new_files and self.files_added_callback:
+                self.files_added_callback(new_files)
+            
+            event.acceptProposedAction()
+    
+    def update_display(self, files: List[str]):
+        """更新显示的文件列表"""
+        self.files = files
+        if files:
+            display_text = "\n".join([f"📄 {f}" if os.path.isfile(f) else f"📁 {f}" for f in files])
+            self.setPlainText(display_text)
+        else:
+            self.clear()
+            self.setPlaceholderText("拖放文件/文件夹到这里，或使用上方按钮添加\n支持多选")
+
 class LogSignals(QObject):
     append_log = Signal(str)
 
@@ -330,6 +389,8 @@ class FeedbackUI(QMainWindow):
         self.log_signals.append_log.connect(self._append_log)
         self.image_path = ""  # 存储图片路径或URL
         self.image_pixmap = None  # 存储原始图片
+        self.context_files: List[str] = []  # 上下文文件路径列表
+        self.temp_image_path = ""  # 临时图片文件路径
 
         self.setWindowTitle("Interactive Feedback MCP")
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -362,6 +423,7 @@ class FeedbackUI(QMainWindow):
         loaded_execute_auto = self.settings.value("execute_automatically", False, type=bool)
         command_section_visible = self.settings.value("commandSectionVisible", False, type=bool)
         image_section_visible = self.settings.value("imageSectionVisible", False, type=bool)  # 图片区域可见性
+        context_section_visible = self.settings.value("contextSectionVisible", False, type=bool)  # 上下文区域可见性
         self.settings.endGroup() # End project-specific group
         
         self.config: FeedbackConfig = {
@@ -384,6 +446,13 @@ class FeedbackUI(QMainWindow):
             self.toggle_image_button.setText("隐藏图片区域")
         else:
             self.toggle_image_button.setText("显示图片区域")
+        
+        # Set context section visibility AFTER _create_ui has created relevant widgets
+        self.context_group.setVisible(context_section_visible)
+        if context_section_visible:
+            self.toggle_context_button.setText("隐藏上下文引用")
+        else:
+            self.toggle_context_button.setText("显示上下文引用")
 
         set_dark_title_bar(self, True)
 
@@ -526,6 +595,41 @@ class FeedbackUI(QMainWindow):
         self.image_group.setVisible(False)  # 默认隐藏
         feedback_layout.addWidget(self.image_group)
 
+        # 上下文文件区域
+        self.toggle_context_button = QPushButton("显示上下文引用")
+        self.toggle_context_button.clicked.connect(self._toggle_context_section)
+        feedback_layout.addWidget(self.toggle_context_button)
+        
+        self.context_group = QGroupBox("上下文引用（可选）")
+        context_layout = QVBoxLayout(self.context_group)
+        
+        # 上下文文件操作按钮行
+        context_btn_layout = QHBoxLayout()
+        add_file_button = QPushButton("添加文件(&F)")
+        add_file_button.clicked.connect(self._add_context_file)
+        add_folder_button = QPushButton("添加文件夹(&D)")
+        add_folder_button.clicked.connect(self._add_context_folder)
+        clear_context_button = QPushButton("清除全部(&C)")
+        clear_context_button.clicked.connect(self._clear_context_files)
+        
+        context_btn_layout.addWidget(add_file_button)
+        context_btn_layout.addWidget(add_folder_button)
+        context_btn_layout.addStretch()
+        context_btn_layout.addWidget(clear_context_button)
+        context_layout.addLayout(context_btn_layout)
+        
+        # 上下文文件列表（支持拖放）
+        self.context_list = ContextFileList()
+        self.context_list.setMinimumHeight(100)
+        self.context_list.setMaximumHeight(200)
+        self.context_list.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
+        self.context_list.setPlaceholderText("拖放文件/文件夹到这里，或使用上方按钮添加\n支持多选")
+        self.context_list.files_added_callback = self._on_context_files_added
+        context_layout.addWidget(self.context_list)
+        
+        self.context_group.setVisible(False)  # 默认隐藏
+        feedback_layout.addWidget(self.context_group)
+
         self.feedback_text = FeedbackTextEdit()
         font_metrics = self.feedback_text.fontMetrics()
         row_height = font_metrics.height()
@@ -613,6 +717,62 @@ class FeedbackUI(QMainWindow):
         current_width = self.width()
         self.resize(current_width, new_height)
 
+    def _toggle_context_section(self):
+        """切换上下文引用区域的显示/隐藏"""
+        is_visible = self.context_group.isVisible()
+        self.context_group.setVisible(not is_visible)
+        if not is_visible:
+            self.toggle_context_button.setText("隐藏上下文引用")
+        else:
+            self.toggle_context_button.setText("显示上下文引用")
+        
+        # 立即保存该项目的可见性状态
+        self.settings.beginGroup(self.project_group_name)
+        self.settings.setValue("contextSectionVisible", self.context_group.isVisible())
+        self.settings.endGroup()
+
+        # 调整窗口高度
+        new_height = self.centralWidget().sizeHint().height()
+        if self.context_group.isVisible() and self.context_group.layout().sizeHint().height() > 0:
+            min_content_height = self.context_group.layout().sizeHint().height() + self.feedback_group.minimumHeight()
+            new_height = max(new_height, min_content_height)
+
+        current_width = self.width()
+        self.resize(current_width, new_height)
+
+    def _add_context_file(self):
+        """添加上下文文件"""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择文件",
+            self.project_directory,
+            "所有文件 (*.*)"
+        )
+        if files:
+            self._on_context_files_added(files)
+
+    def _add_context_folder(self):
+        """添加上下文文件夹"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择文件夹",
+            self.project_directory
+        )
+        if folder:
+            self._on_context_files_added([folder])
+
+    def _on_context_files_added(self, files: List[str]):
+        """上下文文件添加回调"""
+        for f in files:
+            if f not in self.context_files:
+                self.context_files.append(f)
+        self.context_list.update_display(self.context_files)
+
+    def _clear_context_files(self):
+        """清除所有上下文文件"""
+        self.context_files.clear()
+        self.context_list.update_display(self.context_files)
+
     def _update_config(self):
         self.config["run_command"] = self.command_entry.text()
         self.config["execute_automatically"] = self.auto_check.isChecked()
@@ -694,17 +854,38 @@ class FeedbackUI(QMainWindow):
 
     def _submit_feedback(self):
         feedback_text = self.feedback_text.toPlainText().strip()
+        
+        # 处理图片：如果是粘贴的图片，保存到临时文件
+        final_image_path = self.image_path
+        if self.image_pixmap and not self.image_pixmap.isNull():
+            if not self.image_path or self.image_path == "[粘贴的图片]" or not os.path.exists(self.image_path):
+                # 保存图片到临时文件
+                temp_dir = tempfile.gettempdir()
+                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}.png")
+                self.image_pixmap.save(temp_image_path, "PNG")
+                final_image_path = temp_image_path
+                self.temp_image_path = temp_image_path
+        
         # 如果有图片，在反馈文本中添加图片信息
-        if self.image_path:
+        if final_image_path:
             if feedback_text:
-                feedback_text += f"\n\n[图片: {self.image_path}]"
+                feedback_text += f"\n\n[图片: {final_image_path}]"
             else:
-                feedback_text = f"[图片: {self.image_path}]"
+                feedback_text = f"[图片: {final_image_path}]"
+        
+        # 如果有上下文文件，添加到反馈中
+        if self.context_files:
+            context_info = "\n".join([f"  - {f}" for f in self.context_files])
+            if feedback_text:
+                feedback_text += f"\n\n[上下文文件:]\n{context_info}"
+            else:
+                feedback_text = f"[上下文文件:]\n{context_info}"
         
         self.feedback_result = FeedbackResult(
             logs="".join(self.log_buffer),
             interactive_feedback=feedback_text,
-            image_path=self.image_path,
+            image_path=final_image_path,
+            context_files=self.context_files.copy(),
         )
         self.close()
 
@@ -770,9 +951,13 @@ class FeedbackUI(QMainWindow):
                 self.image_path = source
                 self.image_input.setText(source)
             else:
-                # 如果是粘贴的图片，保存为临时文件或标记为粘贴
-                self.image_path = f"[粘贴的图片]"
-                self.image_input.setText("[粘贴的图片]")
+                # 如果是粘贴的图片，立即保存为临时文件
+                temp_dir = tempfile.gettempdir()
+                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}.png")
+                pixmap.save(temp_image_path, "PNG")
+                self.image_path = temp_image_path
+                self.temp_image_path = temp_image_path
+                self.image_input.setText(temp_image_path)
             # 更新显示
             self._update_image_display()
             # 更新样式
@@ -836,6 +1021,7 @@ class FeedbackUI(QMainWindow):
         self.settings.beginGroup(self.project_group_name)
         self.settings.setValue("commandSectionVisible", self.command_group.isVisible())
         self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
+        self.settings.setValue("contextSectionVisible", self.context_group.isVisible())
         self.settings.endGroup()
 
         if self.process:
@@ -850,7 +1036,7 @@ class FeedbackUI(QMainWindow):
             kill_tree(self.process)
 
         if not self.feedback_result:
-            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="")
+            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="", context_files=[])
 
         return self.feedback_result
 
