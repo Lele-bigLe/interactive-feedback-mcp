@@ -26,7 +26,8 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 class FeedbackResult(TypedDict):
     command_logs: str
     interactive_feedback: str
-    image_path: str  # 图片路径或URL
+    image_path: str  # 保持兼容，存储第一张图片路径
+    image_paths: List[str]  # 多图片路径列表
     context_files: List[str]  # 上下文文件路径列表
 
 class FeedbackConfig(TypedDict):
@@ -328,6 +329,107 @@ class ImageLabel(QLabel):
         self.setPixmap(scaled_pixmap)
         self.setText("")
 
+class ImageDropArea(QTextEdit):
+    """支持拖放和粘贴的多图片区域"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setReadOnly(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.image_paths: List[str] = []
+        self.image_added_callback = None  # 图片添加回调
+        self.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴")
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """拖拽进入事件"""
+        if event.mimeData().hasUrls() or event.mimeData().hasImage():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dropEvent(self, event: QDropEvent):
+        """拖放事件"""
+        if event.mimeData().hasImage():
+            # 拖放的是图片数据
+            image_data = event.mimeData().imageData()
+            if image_data:
+                from PySide6.QtGui import QImage
+                if isinstance(image_data, QImage):
+                    pixmap = QPixmap.fromImage(image_data)
+                elif isinstance(image_data, QPixmap):
+                    pixmap = image_data
+                else:
+                    pixmap = QPixmap()
+                if not pixmap.isNull() and self.image_added_callback:
+                    self.image_added_callback(pixmap, "拖放的图片")
+        elif event.mimeData().hasUrls():
+            # 拖放的是文件
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path and os.path.exists(file_path):
+                    # 检查是否是图片文件
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                        pixmap = QPixmap(file_path)
+                        if not pixmap.isNull() and self.image_added_callback:
+                            self.image_added_callback(pixmap, file_path)
+        event.acceptProposedAction()
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        """键盘事件：支持 Ctrl+V 粘贴"""
+        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
+            self._paste_from_clipboard()
+        else:
+            super().keyPressEvent(event)
+    
+    def mousePressEvent(self, event):
+        """鼠标点击事件：点击后获得焦点"""
+        self.setFocus()
+        super().mousePressEvent(event)
+    
+    def _paste_from_clipboard(self):
+        """从剪贴板粘贴图片"""
+        clipboard = QApplication.clipboard()
+        if clipboard.mimeData().hasImage():
+            pixmap = clipboard.pixmap()
+            if not pixmap.isNull() and self.image_added_callback:
+                self.image_added_callback(pixmap, "粘贴的图片")
+        elif clipboard.mimeData().hasUrls():
+            for url in clipboard.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path and os.path.exists(file_path):
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                        pixmap = QPixmap(file_path)
+                        if not pixmap.isNull() and self.image_added_callback:
+                            self.image_added_callback(pixmap, file_path)
+    
+    def update_display(self, image_paths: List[str]):
+        """更新显示的图片列表"""
+        self.image_paths = image_paths
+        if image_paths:
+            display_text = "\n".join([f"🖼️ {os.path.basename(p) if os.path.exists(p) else p}" for p in image_paths])
+            self.setPlainText(display_text)
+            self.setStyleSheet("""
+                border: 2px solid #42a2da; 
+                border-radius: 8px;
+                background-color: #2a2a2a; 
+                color: #fff;
+                font-size: 13px;
+                padding: 8px;
+            """)
+        else:
+            self.clear()
+            self.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴\n支持多张图片")
+            self.setStyleSheet("""
+                border: 2px dashed #555; 
+                border-radius: 8px;
+                background-color: #2a2a2a; 
+                color: #888;
+                font-size: 13px;
+                padding: 8px;
+            """)
+
 class ContextFileList(QTextEdit):
     """支持拖放的上下文文件列表"""
     def __init__(self, parent=None):
@@ -387,10 +489,10 @@ class FeedbackUI(QMainWindow):
         self.feedback_result = None
         self.log_signals = LogSignals()
         self.log_signals.append_log.connect(self._append_log)
-        self.image_path = ""  # 存储图片路径或URL
-        self.image_pixmap = None  # 存储原始图片
+        self.image_paths: List[str] = []  # 多图片路径列表
+        self.image_pixmaps: List[QPixmap] = []  # 存储原始图片列表
         self.context_files: List[str] = []  # 上下文文件路径列表
-        self.temp_image_path = ""  # 临时图片文件路径
+        self.temp_image_counter = 0  # 临时图片计数器
 
         self.setWindowTitle("Interactive Feedback MCP")
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -707,50 +809,44 @@ class FeedbackUI(QMainWindow):
         feedback_layout.addLayout(toggle_layout)
 
         # 图片区域
-        self.image_group = QGroupBox("🖼️ 图片（可选）")
+        self.image_group = QGroupBox("🖼️ 图片（可选，支持多张）")
         image_layout = QVBoxLayout(self.image_group)
         image_layout.setSpacing(8)
         
-        # 图片输入行
-        image_input_layout = QHBoxLayout()
-        image_input_layout.setSpacing(6)
-        self.image_input = QLineEdit()
-        self.image_input.setPlaceholderText("输入图片URL或本地文件路径...")
-        self.image_input.textChanged.connect(self._on_image_path_changed)
-        self.image_input.returnPressed.connect(self._load_image)
+        # 图片操作按钮行
+        image_btn_layout = QHBoxLayout()
+        image_btn_layout.setSpacing(6)
         
-        select_image_button = QPushButton("📂 选择")
+        select_image_button = QPushButton("📂 选择图片")
         select_image_button.clicked.connect(self._select_image_file)
         paste_image_button = QPushButton("📋 粘贴")
         paste_image_button.setObjectName("primaryButton")
         paste_image_button.clicked.connect(self._paste_image)
-        clear_image_button = QPushButton("🗑️")
+        clear_image_button = QPushButton("🗑️ 清除全部")
         clear_image_button.setObjectName("dangerButton")
-        clear_image_button.setFixedWidth(40)
         clear_image_button.clicked.connect(self._clear_image)
         
-        image_input_layout.addWidget(self.image_input, 1)
-        image_input_layout.addWidget(select_image_button)
-        image_input_layout.addWidget(paste_image_button)
-        image_input_layout.addWidget(clear_image_button)
-        image_layout.addLayout(image_input_layout)
+        image_btn_layout.addWidget(select_image_button)
+        image_btn_layout.addWidget(paste_image_button)
+        image_btn_layout.addStretch()
+        image_btn_layout.addWidget(clear_image_button)
+        image_layout.addLayout(image_btn_layout)
         
-        # 图片预览标签（支持粘贴和拖放）
-        self.image_label = ImageLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumHeight(150)
-        self.image_label.setMaximumHeight(300)
-        self.image_label.setStyleSheet("""
+        # 图片列表（支持粘贴和拖放）
+        self.image_list = ImageDropArea()
+        self.image_list.setMinimumHeight(100)
+        self.image_list.setMaximumHeight(200)
+        self.image_list.setStyleSheet("""
             border: 2px dashed #555; 
             border-radius: 8px;
             background-color: #2a2a2a; 
             color: #888;
             font-size: 13px;
+            padding: 8px;
         """)
-        self.image_label.setText("🖼️ 拖放图片到这里\n或按 Ctrl+V 粘贴")
-        self.image_label.setScaledContents(False)
-        self.image_label.set_image_loaded_callback(self._on_image_loaded)
-        image_layout.addWidget(self.image_label)
+        self.image_list.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴\n支持多张图片")
+        self.image_list.image_added_callback = self._on_image_added
+        image_layout.addWidget(self.image_list)
         
         self.image_group.setVisible(False)
         feedback_layout.addWidget(self.image_group)
@@ -1025,23 +1121,13 @@ class FeedbackUI(QMainWindow):
     def _submit_feedback(self):
         feedback_text = self.feedback_text.toPlainText().strip()
         
-        # 处理图片：如果是粘贴的图片，保存到临时文件
-        final_image_path = self.image_path
-        if self.image_pixmap and not self.image_pixmap.isNull():
-            if not self.image_path or self.image_path == "[粘贴的图片]" or not os.path.exists(self.image_path):
-                # 保存图片到临时文件
-                temp_dir = tempfile.gettempdir()
-                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}.png")
-                self.image_pixmap.save(temp_image_path, "PNG")
-                final_image_path = temp_image_path
-                self.temp_image_path = temp_image_path
-        
         # 如果有图片，在反馈文本中添加图片信息
-        if final_image_path:
+        if self.image_paths:
+            images_info = "\n".join([f"  - {p}" for p in self.image_paths])
             if feedback_text:
-                feedback_text += f"\n\n[图片: {final_image_path}]"
+                feedback_text += f"\n\n[图片 ({len(self.image_paths)}张):]\n{images_info}"
             else:
-                feedback_text = f"[图片: {final_image_path}]"
+                feedback_text = f"[图片 ({len(self.image_paths)}张):]\n{images_info}"
         
         # 如果有上下文文件，添加到反馈中
         if self.context_files:
@@ -1054,7 +1140,8 @@ class FeedbackUI(QMainWindow):
         self.feedback_result = FeedbackResult(
             logs="".join(self.log_buffer),
             interactive_feedback=feedback_text,
-            image_path=final_image_path,
+            image_path=self.image_paths[0] if self.image_paths else "",  # 保持兼容
+            image_paths=self.image_paths.copy(),
             context_files=self.context_files.copy(),
         )
         self.close()
@@ -1065,102 +1152,49 @@ class FeedbackUI(QMainWindow):
         self._submit_feedback()
 
     def _select_image_file(self):
-        # 选择本地图片文件
-        file_path, _ = QFileDialog.getOpenFileName(
+        """选择本地图片文件（支持多选）"""
+        files, _ = QFileDialog.getOpenFileNames(
             self,
-            "选择图片文件",
+            "选择图片文件（可多选）",
             "",
             "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
         )
-        if file_path:
-            self.image_input.setText(file_path)
-            self._load_image()
-
-    def _load_image(self):
-        # 加载图片（从URL或本地路径）
-        path = self.image_input.text().strip()
-        if not path:
-            return
-        
-        self.image_path = path
-        
-        # 判断是URL还是本地路径
-        if path.startswith(("http://", "https://")):
-            # URL图片 - 使用网络请求加载（简化版，实际可能需要异步加载）
-            self.image_label.setText(f"URL图片: {path}\n(预览需要网络连接)")
-            self.image_label.setStyleSheet("border: 1px solid #666; background-color: #2a2a2a; color: #fff;")
-        else:
-            # 本地文件路径
-            if os.path.exists(path):
-                pixmap = QPixmap(path)
+        for file_path in files:
+            if file_path:
+                pixmap = QPixmap(file_path)
                 if not pixmap.isNull():
-                    # 保存原始图片
-                    self.image_pixmap = pixmap
-                    # 更新显示
-                    self._update_image_display()
-                else:
-                    self.image_pixmap = None
-                    self.image_label.setText("无法加载图片文件")
-                    self.image_label.setStyleSheet("border: 1px solid #f00; background-color: #2a2a2a; color: #f00;")
-            else:
-                self.image_pixmap = None
-                self.image_label.setText(f"文件不存在: {path}")
-                self.image_label.setStyleSheet("border: 1px solid #f00; background-color: #2a2a2a; color: #f00;")
+                    self._on_image_added(pixmap, file_path)
 
     def _paste_image(self):
         """粘贴图片按钮处理"""
-        self.image_label._paste_from_clipboard()
+        self.image_list._paste_from_clipboard()
 
-    def _on_image_loaded(self, pixmap: QPixmap, source: str):
-        """图片加载回调函数"""
+    def _on_image_added(self, pixmap: QPixmap, source: str):
+        """图片添加回调函数"""
         if not pixmap.isNull():
-            # 保存原始图片
-            self.image_pixmap = pixmap
-            # 设置图片路径
+            # 确定图片路径
             if source and os.path.exists(source):
-                self.image_path = source
-                self.image_input.setText(source)
+                image_path = source
             else:
-                # 如果是粘贴的图片，立即保存为临时文件
+                # 如果是粘贴的图片，保存为临时文件
                 temp_dir = tempfile.gettempdir()
-                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}.png")
+                self.temp_image_counter += 1
+                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}_{self.temp_image_counter}.png")
                 pixmap.save(temp_image_path, "PNG")
-                self.image_path = temp_image_path
-                self.temp_image_path = temp_image_path
-                self.image_input.setText(temp_image_path)
-            # 更新显示
-            self._update_image_display()
-            # 更新样式
-            self.image_label.setStyleSheet("border: 2px solid #42a2da; background-color: #2a2a2a;")
+                image_path = temp_image_path
+            
+            # 添加到列表（避免重复）
+            if image_path not in self.image_paths:
+                self.image_paths.append(image_path)
+                self.image_pixmaps.append(pixmap)
+                self.image_list.update_display(self.image_paths)
 
     def _clear_image(self):
-        # 清除图片
-        self.image_input.clear()
-        self.image_path = ""
-        self.image_pixmap = None
-        self.image_label.clear()
-        self.image_label.setText("点击或拖放图片到这里\n或按 Ctrl+V 粘贴图片")
-        self.image_label.setStyleSheet("border: 2px dashed #666; background-color: #2a2a2a; color: #fff;")
-
-    def _update_image_display(self):
-        # 更新图片显示（当窗口大小改变时调用）
-        if self.image_pixmap and not self.image_pixmap.isNull():
-            # 获取显示区域尺寸，如果为0则使用默认值
-            label_width = self.image_label.width() if self.image_label.width() > 0 else 400
-            label_height = self.image_label.height() if self.image_label.height() > 0 else 300
-            # 缩放图片以适应显示区域
-            scaled_pixmap = self.image_pixmap.scaled(
-                label_width,
-                label_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
-            self.image_label.setText("")
-
-    def _on_image_path_changed(self, text: str):
-        # 当图片路径输入框内容改变时的处理
-        pass
+        """清除所有图片"""
+        self.image_paths.clear()
+        self.image_pixmaps.clear()
+        self.temp_image_counter = 0
+        self.image_list.update_display(self.image_paths)
 
     def clear_logs(self):
         self.log_buffer = []
@@ -1173,12 +1207,6 @@ class FeedbackUI(QMainWindow):
         self.settings.setValue("execute_automatically", self.config["execute_automatically"])
         self.settings.endGroup()
         self._append_log("已保存该项目的配置。\n")
-
-    def resizeEvent(self, event):
-        # 窗口大小改变时，更新图片显示
-        super().resizeEvent(event)
-        if self.image_pixmap:
-            self._update_image_display()
 
     def closeEvent(self, event):
         # Save general UI settings for the main window (geometry, state)
@@ -1206,7 +1234,7 @@ class FeedbackUI(QMainWindow):
             kill_tree(self.process)
 
         if not self.feedback_result:
-            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="", context_files=[])
+            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="", image_paths=[], context_files=[])
 
         return self.feedback_result
 
