@@ -33,6 +33,45 @@ These settings are typically stored in platform-specific locations (e.g., regist
 
 The "Save Configuration" button in the UI primarily saves the current command typed into the command input field and the state of the "Execute automatically on next run" checkbox for the active project. The visibility of the command section is saved automatically when you toggle it. General window size and position are saved when the application closes.
 
+### 环境变量配置
+
+支持通过环境变量配置超时时间：
+
+| 环境变量 | 说明 | 默认值 |
+|---------|------|-------|
+| `INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS` | 超时时间（秒），超时后自动重新调用以保持会话活跃 | 600 |
+
+**配置示例：**
+
+```json
+{
+  "mcpServers": {
+    "interactive-feedback-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/interactive-feedback-mcp",
+        "run",
+        "server.py"
+      ],
+      "timeout": 600,
+      "autoApprove": ["interactive_feedback"],
+      "env": {
+        "INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS": "600"
+      }
+    }
+  }
+}
+```
+
+### 新增功能
+
+1. **项目标识显示** - 窗口标题和界面顶部显示当前项目名称，便于多窗口时快速识别
+2. **超时自动重新调用** - 在规定时间内未收到用户反馈时，自动返回特殊标记，提示AI重新调用以保持会话活跃
+3. **倒计时显示** - 界面显示剩余时间，最后两分钟显示警告颜色
+4. **重新计时按钮** - 可手动重置计时器
+5. **文件选择器优化** - 文件选择器默认打开当前编辑文件所在目录，而非项目根目录
+
 ## Installation (Cursor)
 
 ![Instalation on Cursor](https://github.com/noopstudios/interactive-feedback-mcp/blob/main/.github/cursor-example.jpg?raw=true)

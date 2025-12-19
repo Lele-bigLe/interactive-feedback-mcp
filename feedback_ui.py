@@ -4,35 +4,30 @@
 import os
 import sys
 import json
-import psutil
 import argparse
-import subprocess
-import threading
 import hashlib
 import tempfile
+import time
 from typing import Optional, TypedDict, List
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit, QGroupBox, QFileDialog
+    QLabel, QPushButton, QTextEdit, QGroupBox, QFileDialog
 )
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSettings
 from PySide6.QtGui import (
-    QTextCursor, QIcon, QKeyEvent, QFont, QFontDatabase, QPalette, QColor, 
-    QPixmap, QClipboard
+    QIcon, QKeyEvent, QPalette, QColor, 
+    QPixmap
 )
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 class FeedbackResult(TypedDict):
-    command_logs: str
+    logs: str  # 保留字段，但不再使用命令日志
     interactive_feedback: str
     image_path: str  # 保持兼容，存储第一张图片路径
     image_paths: List[str]  # 多图片路径列表
     context_files: List[str]  # 上下文文件路径列表
-
-class FeedbackConfig(TypedDict):
-    run_command: str
-    execute_automatically: bool
+    timeout_triggered: bool  # 是否因超时触发重新调用
 
 def set_dark_title_bar(widget: QWidget, dark_title_bar: bool) -> None:
     # Ensure we're on Windows
@@ -92,112 +87,6 @@ def get_dark_mode_palette(app: QApplication):
     darkPalette.setColor(QPalette.Disabled, QPalette.HighlightedText, QColor(127, 127, 127))
     darkPalette.setColor(QPalette.PlaceholderText, QColor(127, 127, 127))
     return darkPalette
-
-def kill_tree(process: subprocess.Popen):
-    killed: list[psutil.Process] = []
-    parent = psutil.Process(process.pid)
-    for proc in parent.children(recursive=True):
-        try:
-            proc.kill()
-            killed.append(proc)
-        except psutil.Error:
-            pass
-    try:
-        parent.kill()
-    except psutil.Error:
-        pass
-    killed.append(parent)
-
-    # Terminate any remaining processes
-    for proc in killed:
-        try:
-            if proc.is_running():
-                proc.terminate()
-        except psutil.Error:
-            pass
-
-def get_user_environment() -> dict[str, str]:
-    if sys.platform != "win32":
-        return os.environ.copy()
-
-    import ctypes
-    from ctypes import wintypes
-
-    # Load required DLLs
-    advapi32 = ctypes.WinDLL("advapi32")
-    userenv = ctypes.WinDLL("userenv")
-    kernel32 = ctypes.WinDLL("kernel32")
-
-    # Constants
-    TOKEN_QUERY = 0x0008
-
-    # Function prototypes
-    OpenProcessToken = advapi32.OpenProcessToken
-    OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    OpenProcessToken.restype = wintypes.BOOL
-
-    CreateEnvironmentBlock = userenv.CreateEnvironmentBlock
-    CreateEnvironmentBlock.argtypes = [ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.BOOL]
-    CreateEnvironmentBlock.restype = wintypes.BOOL
-
-    DestroyEnvironmentBlock = userenv.DestroyEnvironmentBlock
-    DestroyEnvironmentBlock.argtypes = [wintypes.LPVOID]
-    DestroyEnvironmentBlock.restype = wintypes.BOOL
-
-    GetCurrentProcess = kernel32.GetCurrentProcess
-    GetCurrentProcess.argtypes = []
-    GetCurrentProcess.restype = wintypes.HANDLE
-
-    CloseHandle = kernel32.CloseHandle
-    CloseHandle.argtypes = [wintypes.HANDLE]
-    CloseHandle.restype = wintypes.BOOL
-
-    # Get process token
-    token = wintypes.HANDLE()
-    if not OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
-        raise RuntimeError("Failed to open process token")
-
-    try:
-        # Create environment block
-        environment = ctypes.c_void_p()
-        if not CreateEnvironmentBlock(ctypes.byref(environment), token, False):
-            raise RuntimeError("Failed to create environment block")
-
-        try:
-            # Convert environment block to list of strings
-            result = {}
-            env_ptr = ctypes.cast(environment, ctypes.POINTER(ctypes.c_wchar))
-            offset = 0
-
-            while True:
-                # Get string at current offset
-                current_string = ""
-                while env_ptr[offset] != "\0":
-                    current_string += env_ptr[offset]
-                    offset += 1
-
-                # Skip null terminator
-                offset += 1
-
-                # Break if we hit double null terminator
-                if not current_string:
-                    break
-
-                equal_index = current_string.index("=")
-                if equal_index == -1:
-                    continue
-
-                key = current_string[:equal_index]
-                value = current_string[equal_index + 1:]
-                result[key] = value
-
-            return result
-
-        finally:
-            DestroyEnvironmentBlock(environment)
-
-    finally:
-        CloseHandle(token)
 
 class FeedbackTextEdit(QTextEdit):
     """自定义文本编辑器，只接受纯文本粘贴"""
@@ -475,26 +364,26 @@ class ContextFileList(QTextEdit):
             self.clear()
             self.setPlaceholderText("拖放文件/文件夹到这里，或使用上方按钮添加\n支持多选")
 
-class LogSignals(QObject):
-    append_log = Signal(str)
-
 class FeedbackUI(QMainWindow):
-    def __init__(self, project_directory: str, prompt: str):
+    def __init__(self, project_directory: str, prompt: str, current_file: Optional[str] = None, timeout_seconds: int = 600, options: Optional[List[str]] = None):
         super().__init__()
         self.project_directory = project_directory
         self.prompt = prompt
+        self.current_file = current_file  # 当前编辑文件路径
+        self.timeout_seconds = timeout_seconds  # 超时时间
+        self.start_time = time.time()  # 记录开始时间
+        self.timeout_triggered = False  # 超时标志
+        self.options = options or []  # 解决方案选项列表
 
-        self.process: Optional[subprocess.Popen] = None
-        self.log_buffer = []
         self.feedback_result = None
-        self.log_signals = LogSignals()
-        self.log_signals.append_log.connect(self._append_log)
         self.image_paths: List[str] = []  # 多图片路径列表
         self.image_pixmaps: List[QPixmap] = []  # 存储原始图片列表
         self.context_files: List[str] = []  # 上下文文件路径列表
         self.temp_image_counter = 0  # 临时图片计数器
 
-        self.setWindowTitle("Interactive Feedback MCP")
+        # 获取项目名称（用于显示）
+        self.project_name = os.path.basename(os.path.normpath(project_directory))
+        self.setWindowTitle(f"Interactive Feedback - [{self.project_name}]")
         script_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(script_dir, "images", "feedback.png")
         self.setWindowIcon(QIcon(icon_path))
@@ -518,29 +407,14 @@ class FeedbackUI(QMainWindow):
             self.restoreState(state)
         self.settings.endGroup() # End "MainWindow_General" group
         
-        # Load project-specific settings (command, auto-execute, command section visibility)
+        # Load project-specific settings
         self.project_group_name = get_project_settings_group(self.project_directory)
         self.settings.beginGroup(self.project_group_name)
-        loaded_run_command = self.settings.value("run_command", "", type=str)
-        loaded_execute_auto = self.settings.value("execute_automatically", False, type=bool)
-        command_section_visible = self.settings.value("commandSectionVisible", False, type=bool)
         image_section_visible = self.settings.value("imageSectionVisible", False, type=bool)  # 图片区域可见性
         context_section_visible = self.settings.value("contextSectionVisible", False, type=bool)  # 上下文区域可见性
         self.settings.endGroup() # End project-specific group
-        
-        self.config: FeedbackConfig = {
-            "run_command": loaded_run_command,
-            "execute_automatically": loaded_execute_auto
-        }
 
-        self._create_ui() # self.config is used here to set initial values
-
-        # Set command section visibility AFTER _create_ui has created relevant widgets
-        self.command_group.setVisible(command_section_visible)
-        if command_section_visible:
-            self.toggle_command_button.setText("➖ 隐藏命令区域")
-        else:
-            self.toggle_command_button.setText("📂 显示命令区域")
+        self._create_ui()
         
         # Set image section visibility AFTER _create_ui has created relevant widgets
         self.image_group.setVisible(image_section_visible)
@@ -558,17 +432,8 @@ class FeedbackUI(QMainWindow):
 
         set_dark_title_bar(self, True)
 
-        if self.config.get("execute_automatically", False):
-            self._run_command()
-
-    def _format_windows_path(self, path: str) -> str:
-        if sys.platform == "win32":
-            # Convert forward slashes to backslashes
-            path = path.replace("/", "\\")
-            # Capitalize drive letter if path starts with x:\
-            if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
-                path = path[0].upper() + path[1:]
-        return path
+        # 启动超时计时器
+        self._setup_timeout_timer()
 
     def _apply_styles(self):
         """应用全局样式表"""
@@ -710,73 +575,75 @@ class FeedbackUI(QMainWindow):
         # 全局样式表
         self._apply_styles()
 
-        # Toggle Command Section Button
-        self.toggle_command_button = QPushButton("📂 显示命令区域")
-        self.toggle_command_button.setObjectName("toggleButton")
-        self.toggle_command_button.clicked.connect(self._toggle_command_section)
-        layout.addWidget(self.toggle_command_button)
-
-        # Command section
-        self.command_group = QGroupBox("命令")
-        command_layout = QVBoxLayout(self.command_group)
-
-        # Working directory label
-        formatted_path = self._format_windows_path(self.project_directory)
-        working_dir_label = QLabel(f"工作目录: {formatted_path}")
-        command_layout.addWidget(working_dir_label)
-
-        # Command input row
-        command_input_layout = QHBoxLayout()
-        self.command_entry = QLineEdit()
-        self.command_entry.setText(self.config["run_command"])
-        self.command_entry.returnPressed.connect(self._run_command)
-        self.command_entry.textChanged.connect(self._update_config)
-        self.run_button = QPushButton("运行(&R)")
-        self.run_button.clicked.connect(self._run_command)
-
-        command_input_layout.addWidget(self.command_entry)
-        command_input_layout.addWidget(self.run_button)
-        command_layout.addLayout(command_input_layout)
-
-        # Auto-execute and save config row
-        auto_layout = QHBoxLayout()
-        self.auto_check = QCheckBox("下次运行时自动执行")
-        self.auto_check.setChecked(self.config.get("execute_automatically", False))
-        self.auto_check.stateChanged.connect(self._update_config)
-
-        save_button = QPushButton("保存配置(&S)")
-        save_button.clicked.connect(self._save_config)
-
-        auto_layout.addWidget(self.auto_check)
-        auto_layout.addStretch()
-        auto_layout.addWidget(save_button)
-        command_layout.addLayout(auto_layout)
-
-        # Console section (now part of command_group)
-        console_group = QGroupBox("控制台")
-        console_layout_internal = QVBoxLayout(console_group)
-        console_group.setMinimumHeight(200)
-
-        # Log text area
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        font = QFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
-        font.setPointSize(9)
-        self.log_text.setFont(font)
-        console_layout_internal.addWidget(self.log_text)
-
-        # Clear button
-        button_layout = QHBoxLayout()
-        self.clear_button = QPushButton("清除(&C)")
-        self.clear_button.clicked.connect(self.clear_logs)
-        button_layout.addStretch()
-        button_layout.addWidget(self.clear_button)
-        console_layout_internal.addLayout(button_layout)
+        # 项目标识和超时计时器区域
+        project_info_layout = QHBoxLayout()
+        project_info_layout.setSpacing(12)
         
-        command_layout.addWidget(console_group)
-
-        self.command_group.setVisible(False) 
-        layout.addWidget(self.command_group)
+        # 项目名称标签
+        self.project_label = QLabel(f"📁 {self.project_name}")
+        self.project_label.setStyleSheet("""
+            font-size: 14px;
+            font-weight: bold;
+            color: #4a9eff;
+            padding: 4px 10px;
+            background-color: #2a3a4a;
+            border-radius: 4px;
+        """)
+        self.project_label.setToolTip(f"项目路径: {self.project_directory}")
+        project_info_layout.addWidget(self.project_label)
+        
+        project_info_layout.addStretch()
+        
+        # 超时倒计时标签
+        self.timeout_label = QLabel()
+        self.timeout_label.setStyleSheet("""
+            font-size: 12px;
+            color: #aaa;
+            padding: 4px 8px;
+            background-color: #333;
+            border-radius: 4px;
+        """)
+        project_info_layout.addWidget(self.timeout_label)
+        
+        # 重新计时按钮
+        self.reset_timer_button = QPushButton("🔄 重新计时")
+        self.reset_timer_button.setFixedWidth(90)
+        self.reset_timer_button.setStyleSheet("""
+            QPushButton {
+                font-size: 11px;
+                padding: 4px 8px;
+                background-color: #3a5a3a;
+                border: 1px solid #4a6a4a;
+                border-radius: 4px;
+                color: #cfc;
+            }
+            QPushButton:hover {
+                background-color: #4a6a4a;
+            }
+        """)
+        self.reset_timer_button.clicked.connect(self._reset_timeout)
+        project_info_layout.addWidget(self.reset_timer_button)
+        
+        # 停止计时按钮
+        self.stop_timer_button = QPushButton("⏹️ 停止")
+        self.stop_timer_button.setFixedWidth(70)
+        self.stop_timer_button.setStyleSheet("""
+            QPushButton {
+                font-size: 11px;
+                padding: 4px 8px;
+                background-color: #5a4a3a;
+                border: 1px solid #6a5a4a;
+                border-radius: 4px;
+                color: #ffc;
+            }
+            QPushButton:hover {
+                background-color: #6a5a4a;
+            }
+        """)
+        self.stop_timer_button.clicked.connect(self._stop_timeout)
+        project_info_layout.addWidget(self.stop_timer_button)
+        
+        layout.addLayout(project_info_layout)
 
         # Feedback section with adjusted height
         self.feedback_group = QGroupBox("💬 反馈")
@@ -893,6 +760,39 @@ class FeedbackUI(QMainWindow):
         self.context_group.setVisible(False)
         feedback_layout.addWidget(self.context_group)
 
+        # 解决方案选项区域（如果有选项的话）
+        if self.options:
+            self.options_group = QGroupBox("💡 快速选择")
+            options_layout = QVBoxLayout(self.options_group)
+            options_layout.setSpacing(6)
+            
+            self.option_buttons = []
+            for i, option in enumerate(self.options):
+                btn = QPushButton(f"{i + 1}. {option}")
+                btn.setStyleSheet("""
+                    QPushButton {
+                        text-align: left;
+                        padding: 10px 12px;
+                        background-color: #2a3a4a;
+                        border: 1px solid #3a5a7a;
+                        border-radius: 6px;
+                        color: #9cf;
+                        font-size: 13px;
+                    }
+                    QPushButton:hover {
+                        background-color: #3a4a5a;
+                        border-color: #4a6a8a;
+                    }
+                    QPushButton:pressed {
+                        background-color: #1a2a3a;
+                    }
+                """)
+                btn.clicked.connect(lambda checked, opt=option: self._select_option(opt))
+                options_layout.addWidget(btn)
+                self.option_buttons.append(btn)
+            
+            feedback_layout.addWidget(self.options_group)
+
         # 反馈文本输入区
         self.feedback_text = FeedbackTextEdit()
         font_metrics = self.feedback_text.fontMetrics()
@@ -929,17 +829,150 @@ class FeedbackUI(QMainWindow):
         contact_label.setStyleSheet("font-size: 10px; color: #666; padding: 8px;")
         layout.addWidget(contact_label)
 
+    def _setup_timeout_timer(self):
+        """设置超时计时器"""
+        self.timeout_timer = QTimer()
+        self.timeout_timer.timeout.connect(self._update_timeout_display)
+        self.timeout_timer.start(1000)  # 每秒更新一次
+        self._update_timeout_display()
+
+    def _update_timeout_display(self):
+        """更新超时倒计时显示"""
+        elapsed = time.time() - self.start_time
+        remaining = max(0, self.timeout_seconds - elapsed)
+        
+        minutes = int(remaining // 60)
+        seconds = int(remaining % 60)
+        
+        if remaining <= 0:
+            # 超时，触发自动提交
+            self.timeout_timer.stop()
+            self._trigger_timeout()
+        elif remaining <= 60:
+            # 最后一分钟，显示红色警告
+            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
+            self.timeout_label.setStyleSheet("""
+                font-size: 12px;
+                color: #ff6666;
+                padding: 4px 8px;
+                background-color: #4a2a2a;
+                border-radius: 4px;
+                font-weight: bold;
+            """)
+        elif remaining <= 120:
+            # 两分钟内，显示橙色
+            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
+            self.timeout_label.setStyleSheet("""
+                font-size: 12px;
+                color: #ffaa66;
+                padding: 4px 8px;
+                background-color: #4a3a2a;
+                border-radius: 4px;
+            """)
+        else:
+            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
+            self.timeout_label.setStyleSheet("""
+                font-size: 12px;
+                color: #aaa;
+                padding: 4px 8px;
+                background-color: #333;
+                border-radius: 4px;
+            """)
+
+    def _reset_timeout(self):
+        """重新计时"""
+        self.start_time = time.time()
+        # 如果计时器已停止，重新启动
+        if not self.timeout_timer.isActive():
+            self.timeout_timer.start(1000)
+            self.stop_timer_button.setText("⏹️ 停止")
+            self.stop_timer_button.setStyleSheet("""
+                QPushButton {
+                    font-size: 11px;
+                    padding: 4px 8px;
+                    background-color: #5a4a3a;
+                    border: 1px solid #6a5a4a;
+                    border-radius: 4px;
+                    color: #ffc;
+                }
+                QPushButton:hover {
+                    background-color: #6a5a4a;
+                }
+            """)
+        self._update_timeout_display()
+
+    def _stop_timeout(self):
+        """停止/恢复计时"""
+        if self.timeout_timer.isActive():
+            # 停止计时
+            self.timeout_timer.stop()
+            self.timeout_label.setText("⏸️ 已暂停")
+            self.timeout_label.setStyleSheet("""
+                font-size: 12px;
+                color: #ffc;
+                padding: 4px 8px;
+                background-color: #5a4a3a;
+                border-radius: 4px;
+            """)
+            self.stop_timer_button.setText("▶️ 恢复")
+            self.stop_timer_button.setStyleSheet("""
+                QPushButton {
+                    font-size: 11px;
+                    padding: 4px 8px;
+                    background-color: #3a5a3a;
+                    border: 1px solid #4a6a4a;
+                    border-radius: 4px;
+                    color: #cfc;
+                }
+                QPushButton:hover {
+                    background-color: #4a6a4a;
+                }
+            """)
+        else:
+            # 恢复计时（重新开始计时）
+            self.start_time = time.time()
+            self.timeout_timer.start(1000)
+            self.stop_timer_button.setText("⏹️ 停止")
+            self.stop_timer_button.setStyleSheet("""
+                QPushButton {
+                    font-size: 11px;
+                    padding: 4px 8px;
+                    background-color: #5a4a3a;
+                    border: 1px solid #6a5a4a;
+                    border-radius: 4px;
+                    color: #ffc;
+                }
+                QPushButton:hover {
+                    background-color: #6a5a4a;
+                }
+            """)
+            self._update_timeout_display()
+
+    def _trigger_timeout(self):
+        """超时触发，自动提交以保持会话活跃"""
+        self.timeout_triggered = True
+        self.feedback_result = FeedbackResult(
+            logs="",
+            interactive_feedback="[会话保持] 等待用户输入中...",
+            image_path="",
+            image_paths=[],
+            context_files=[],
+            timeout_triggered=True,
+        )
+        self.close()
+
     def _adjust_window_height(self):
         """调整窗口高度以适应内容变化（保持宽度不变）"""
-        # 保存当前宽度
+        # 保存当前宽度和高度
         current_width = self.width()
+        current_height = self.height()
         
         # 先处理布局更新
         self.centralWidget().updateGeometry()
         QApplication.processEvents()
         
         # 使用 sizeHint 获取建议高度
-        hint_height = self.centralWidget().sizeHint().height()
+        hint_height = self.centralWidget().sizeHint().height() + 40  # 添加一些边距
         
         # 设置窗口的最小和最大高度限制
         min_height = 300  # 最小高度
@@ -948,29 +981,55 @@ class FeedbackUI(QMainWindow):
         # 计算新高度
         new_height = max(min_height, min(hint_height, max_height))
         
-        # 设置固定宽度，只调整高度
-        self.setFixedWidth(current_width)
-        self.resize(current_width, new_height)
+        # 如果高度变化不大，直接调整
+        if abs(new_height - current_height) < 10:
+            return
         
-        # 恢复宽度可调整
-        self.setMinimumWidth(400)
-        self.setMaximumWidth(16777215)  # Qt 默认最大值
+        # 使用定时器实现平滑动画效果
+        self._animate_height(current_height, new_height, current_width)
 
-    def _toggle_command_section(self):
-        is_visible = self.command_group.isVisible()
-        self.command_group.setVisible(not is_visible)
-        if not is_visible:
-            self.toggle_command_button.setText("➖ 隐藏命令区域")
-        else:
-            self.toggle_command_button.setText("📂 显示命令区域")
+    def _animate_height(self, start_height: int, end_height: int, width: int):
+        """使用动画效果平滑调整窗口高度"""
+        # 计算步数和每步的高度变化
+        steps = 8
+        height_diff = end_height - start_height
+        step_size = height_diff / steps
         
-        # Immediately save the visibility state for this project
-        self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("commandSectionVisible", self.command_group.isVisible())
-        self.settings.endGroup()
+        # 当前步数
+        self._animation_step = 0
+        self._animation_target = end_height
+        self._animation_width = width
+        self._animation_step_size = step_size
+        self._animation_steps = steps
+        self._animation_start = start_height
+        
+        # 创建动画定时器
+        if not hasattr(self, '_height_animation_timer'):
+            from PySide6.QtCore import QTimer
+            self._height_animation_timer = QTimer()
+            self._height_animation_timer.timeout.connect(self._animate_height_step)
+        
+        # 启动动画
+        self._height_animation_timer.start(15)  # 约60fps
 
-        # 调整窗口高度
-        self._adjust_window_height()
+    def _animate_height_step(self):
+        """动画步骤"""
+        self._animation_step += 1
+        
+        if self._animation_step >= self._animation_steps:
+            # 动画完成
+            self._height_animation_timer.stop()
+            self.resize(self._animation_width, self._animation_target)
+            self.setMinimumWidth(400)
+            self.setMaximumWidth(16777215)
+            return
+        
+        # 使用缓动函数计算当前高度（ease-out效果）
+        progress = self._animation_step / self._animation_steps
+        eased_progress = 1 - (1 - progress) ** 2  # 二次缓出
+        current_height = int(self._animation_start + (self._animation_target - self._animation_start) * eased_progress)
+        
+        self.resize(self._animation_width, current_height)
 
     def _toggle_image_section(self):
         """切换图片区域的显示/隐藏"""
@@ -1006,12 +1065,32 @@ class FeedbackUI(QMainWindow):
         # 调整窗口高度
         self._adjust_window_height()
 
+    def _select_option(self, option: str):
+        """选择一个解决方案选项"""
+        self.feedback_text.setPlainText(f"[选择方案] {option}")
+        self._submit_feedback()
+
+    def _get_file_dialog_initial_dir(self) -> str:
+        """获取文件对话框的初始目录
+        
+        优先使用当前编辑文件所在目录，否则使用项目目录
+        """
+        if self.current_file and os.path.exists(self.current_file):
+            # 如果是文件，返回其所在目录
+            if os.path.isfile(self.current_file):
+                return os.path.dirname(self.current_file)
+            # 如果是目录，直接返回
+            return self.current_file
+        return self.project_directory
+
     def _add_context_file(self):
         """添加上下文文件"""
+        # 优先使用当前文件所在目录，否则使用项目目录
+        initial_dir = self._get_file_dialog_initial_dir()
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "选择文件",
-            self.project_directory,
+            initial_dir,
             "所有文件 (*.*)"
         )
         if files:
@@ -1019,10 +1098,11 @@ class FeedbackUI(QMainWindow):
 
     def _add_context_folder(self):
         """添加上下文文件夹"""
+        initial_dir = self._get_file_dialog_initial_dir()
         folder = QFileDialog.getExistingDirectory(
             self,
             "选择文件夹",
-            self.project_directory
+            initial_dir
         )
         if folder:
             self._on_context_files_added([folder])
@@ -1038,85 +1118,6 @@ class FeedbackUI(QMainWindow):
         """清除所有上下文文件"""
         self.context_files.clear()
         self.context_list.update_display(self.context_files)
-
-    def _update_config(self):
-        self.config["run_command"] = self.command_entry.text()
-        self.config["execute_automatically"] = self.auto_check.isChecked()
-
-    def _append_log(self, text: str):
-        self.log_buffer.append(text)
-        self.log_text.append(text.rstrip())
-        cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_text.setTextCursor(cursor)
-
-    def _check_process_status(self):
-        if self.process and self.process.poll() is not None:
-            # Process has terminated
-            exit_code = self.process.poll()
-            self._append_log(f"\n进程已退出，退出码: {exit_code}\n")
-            self.run_button.setText("运行(&R)")
-            self.process = None
-            self.activateWindow()
-            self.feedback_text.setFocus()
-
-    def _run_command(self):
-        if self.process:
-            kill_tree(self.process)
-            self.process = None
-            self.run_button.setText("运行(&R)")
-            return
-
-        # Clear the log buffer but keep UI logs visible
-        self.log_buffer = []
-
-        command = self.command_entry.text()
-        if not command:
-            self._append_log("请输入要运行的命令\n")
-            return
-
-        self._append_log(f"$ {command}\n")
-        self.run_button.setText("停止(&P)")
-
-        try:
-            self.process = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=self.project_directory,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=get_user_environment(),
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="ignore",
-                close_fds=True,
-            )
-
-            def read_output(pipe):
-                for line in iter(pipe.readline, ""):
-                    self.log_signals.append_log.emit(line)
-
-            threading.Thread(
-                target=read_output,
-                args=(self.process.stdout,),
-                daemon=True
-            ).start()
-
-            threading.Thread(
-                target=read_output,
-                args=(self.process.stderr,),
-                daemon=True
-            ).start()
-
-            # Start process status checking
-            self.status_timer = QTimer()
-            self.status_timer.timeout.connect(self._check_process_status)
-            self.status_timer.start(100)  # Check every 100ms
-
-        except Exception as e:
-            self._append_log(f"运行命令时出错: {str(e)}\n")
-            self.run_button.setText("运行(&R)")
 
     def _submit_feedback(self):
         feedback_text = self.feedback_text.toPlainText().strip()
@@ -1138,11 +1139,12 @@ class FeedbackUI(QMainWindow):
                 feedback_text = f"[上下文文件:]\n{context_info}"
         
         self.feedback_result = FeedbackResult(
-            logs="".join(self.log_buffer),
+            logs="",
             interactive_feedback=feedback_text,
             image_path=self.image_paths[0] if self.image_paths else "",  # 保持兼容
             image_paths=self.image_paths.copy(),
             context_files=self.context_files.copy(),
+            timeout_triggered=False,
         )
         self.close()
 
@@ -1153,10 +1155,11 @@ class FeedbackUI(QMainWindow):
 
     def _select_image_file(self):
         """选择本地图片文件（支持多选）"""
+        initial_dir = self._get_file_dialog_initial_dir()
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "选择图片文件（可多选）",
-            self.project_directory,
+            initial_dir,
             "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
         )
         for file_path in files:
@@ -1196,18 +1199,6 @@ class FeedbackUI(QMainWindow):
         self.temp_image_counter = 0
         self.image_list.update_display(self.image_paths)
 
-    def clear_logs(self):
-        self.log_buffer = []
-        self.log_text.clear()
-
-    def _save_config(self):
-        # Save run_command and execute_automatically to QSettings under project group
-        self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("run_command", self.config["run_command"])
-        self.settings.setValue("execute_automatically", self.config["execute_automatically"])
-        self.settings.endGroup()
-        self._append_log("已保存该项目的配置。\n")
-
     def closeEvent(self, event):
         # Save general UI settings for the main window (geometry, state)
         self.settings.beginGroup("MainWindow_General")
@@ -1215,26 +1206,20 @@ class FeedbackUI(QMainWindow):
         self.settings.setValue("windowState", self.saveState())
         self.settings.endGroup()
 
-        # Save project-specific command section visibility (this is now slightly redundant due to immediate save in toggle, but harmless)
+        # Save project-specific section visibility
         self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("commandSectionVisible", self.command_group.isVisible())
         self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
         self.settings.setValue("contextSectionVisible", self.context_group.isVisible())
         self.settings.endGroup()
 
-        if self.process:
-            kill_tree(self.process)
         super().closeEvent(event)
 
     def run(self) -> FeedbackResult:
         self.show()
         QApplication.instance().exec()
 
-        if self.process:
-            kill_tree(self.process)
-
         if not self.feedback_result:
-            return FeedbackResult(logs="".join(self.log_buffer), interactive_feedback="", image_path="", image_paths=[], context_files=[])
+            return FeedbackResult(logs="", interactive_feedback="", image_path="", image_paths=[], context_files=[], timeout_triggered=False)
 
         return self.feedback_result
 
@@ -1245,11 +1230,21 @@ def get_project_settings_group(project_dir: str) -> str:
     full_hash = hashlib.md5(project_dir.encode('utf-8')).hexdigest()[:8]
     return f"{basename}_{full_hash}"
 
-def feedback_ui(project_directory: str, prompt: str, output_file: Optional[str] = None) -> Optional[FeedbackResult]:
+def feedback_ui(project_directory: str, prompt: str, output_file: Optional[str] = None, current_file: Optional[str] = None, timeout_seconds: int = 600, options: Optional[List[str]] = None) -> Optional[FeedbackResult]:
+    """启动反馈UI界面
+    
+    参数:
+        project_directory: 项目目录路径
+        prompt: 提示信息
+        output_file: 输出文件路径
+        current_file: 当前编辑的文件路径（用于文件选择器初始目录）
+        timeout_seconds: 超时时间（秒），超时后自动提交以保持会话活跃
+        options: 可选的解决方案列表，供用户快速选择
+    """
     app = QApplication.instance() or QApplication()
     app.setPalette(get_dark_mode_palette(app))
     app.setStyle("Fusion")
-    ui = FeedbackUI(project_directory, prompt)
+    ui = FeedbackUI(project_directory, prompt, current_file, timeout_seconds, options)
     result = ui.run()
 
     if output_file and result:
@@ -1267,9 +1262,20 @@ if __name__ == "__main__":
     parser.add_argument("--project-directory", default=os.getcwd(), help="运行命令的项目目录")
     parser.add_argument("--prompt", default="我已经实现了您请求的更改。", help="显示给用户的提示")
     parser.add_argument("--output-file", help="保存反馈结果为 JSON 的路径")
+    parser.add_argument("--current-file", help="当前编辑的文件路径（用于文件选择器）")
+    parser.add_argument("--timeout", type=int, default=600, help="超时时间（秒），默认600秒")
+    parser.add_argument("--options", help="解决方案选项列表（JSON格式）")
     args = parser.parse_args()
 
-    result = feedback_ui(args.project_directory, args.prompt, args.output_file)
+    # 解析选项
+    options = None
+    if args.options:
+        try:
+            options = json.loads(args.options)
+        except json.JSONDecodeError:
+            pass
+
+    result = feedback_ui(args.project_directory, args.prompt, args.output_file, args.current_file, args.timeout, options)
     if result:
         print(f"\n收集的日志: \n{result['logs']}")
         print(f"\n收到的反馈:\n{result['interactive_feedback']}")
