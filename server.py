@@ -8,7 +8,7 @@ import tempfile
 import subprocess
 import time
 
-from typing import Annotated, Dict, Optional
+from typing import Annotated, Dict, Optional, List
 
 from fastmcp import FastMCP
 from pydantic import Field
@@ -19,7 +19,7 @@ INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS = int(os.environ.get("INTERACTIVE_FEEDBACK_
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
 mcp = FastMCP("Interactive Feedback MCP", log_level="ERROR")
 
-def launch_feedback_ui(project_directory: str, summary: str, current_file: Optional[str] = None, timeout_seconds: int = INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS, options: Optional[list] = None) -> dict[str, str]:
+def launch_feedback_ui(project_directory: str, summary: str, current_file: Optional[str] = None, timeout_seconds: int = INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS, options: Optional[List[str]] = None) -> dict[str, str]:
     """
     启动反馈UI界面
     
@@ -87,8 +87,8 @@ def first_line(text: str) -> str:
 def interactive_feedback(
     project_directory: Annotated[str, Field(description="Full path to the project directory")],
     summary: Annotated[str, Field(description="Short, one-line summary of the changes")],
-    current_file: Annotated[Optional[str], Field(description="Current file being edited, used for file dialog initial directory", default=None)] = None,
-    options: Annotated[Optional[list], Field(description="Optional list of solution options for user to choose from, e.g. ['Option A: ...', 'Option B: ...']", default=None)] = None,
+    current_file: Annotated[Optional[str], Field(description="Current file being edited, used for file dialog initial directory")] = None,
+    options: Annotated[Optional[List], Field(description="Optional list of solution options for user to choose from, e.g. ['Option A: ...', 'Option B: ...']")] = None,
 ) -> Dict[str, str]:
     """
     Request interactive feedback for a given project directory and summary.

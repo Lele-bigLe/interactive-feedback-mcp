@@ -762,35 +762,39 @@ class FeedbackUI(QMainWindow):
 
         # 解决方案选项区域（如果有选项的话）
         if self.options:
-            self.options_group = QGroupBox("💡 快速选择")
-            options_layout = QVBoxLayout(self.options_group)
-            options_layout.setSpacing(6)
+            self.options_group = QGroupBox("💡 快速选择（点击填充到输入框）")
+            options_layout = QHBoxLayout(self.options_group)  # 改为水平布局
+            options_layout.setSpacing(8)
             
             self.option_buttons = []
             for i, option in enumerate(self.options):
-                btn = QPushButton(f"{i + 1}. {option}")
+                btn = QPushButton(f"{option}")
+                btn.setToolTip(f"点击选择: {option}")
                 btn.setStyleSheet("""
                     QPushButton {
-                        text-align: left;
-                        padding: 10px 12px;
-                        background-color: #2a3a4a;
-                        border: 1px solid #3a5a7a;
-                        border-radius: 6px;
-                        color: #9cf;
-                        font-size: 13px;
+                        text-align: center;
+                        padding: 8px 16px;
+                        background-color: #2a4a3a;
+                        border: 1px solid #3a6a4a;
+                        border-radius: 16px;
+                        color: #9fc;
+                        font-size: 12px;
+                        min-width: 80px;
                     }
                     QPushButton:hover {
-                        background-color: #3a4a5a;
-                        border-color: #4a6a8a;
+                        background-color: #3a5a4a;
+                        border-color: #4a7a5a;
+                        color: #bfe;
                     }
                     QPushButton:pressed {
-                        background-color: #1a2a3a;
+                        background-color: #1a3a2a;
                     }
                 """)
                 btn.clicked.connect(lambda checked, opt=option: self._select_option(opt))
                 options_layout.addWidget(btn)
                 self.option_buttons.append(btn)
             
+            options_layout.addStretch()  # 添加弹性空间
             feedback_layout.addWidget(self.options_group)
 
         # 反馈文本输入区
@@ -1066,9 +1070,13 @@ class FeedbackUI(QMainWindow):
         self._adjust_window_height()
 
     def _select_option(self, option: str):
-        """选择一个解决方案选项"""
-        self.feedback_text.setPlainText(f"[选择方案] {option}")
-        self._submit_feedback()
+        """选择一个解决方案选项，填充到输入框但不自动提交"""
+        self.feedback_text.setPlainText(f"[选择方案] {option}\n\n")
+        # 将光标移动到末尾，方便用户追加内容
+        cursor = self.feedback_text.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.feedback_text.setTextCursor(cursor)
+        self.feedback_text.setFocus()
 
     def _get_file_dialog_initial_dir(self) -> str:
         """获取文件对话框的初始目录

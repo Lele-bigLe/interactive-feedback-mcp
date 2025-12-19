@@ -71,6 +71,16 @@ The "Save Configuration" button in the UI primarily saves the current command ty
 3. **倒计时显示** - 界面显示剩余时间，最后两分钟显示警告颜色
 4. **重新计时按钮** - 可手动重置计时器
 5. **文件选择器优化** - 文件选择器默认打开当前编辑文件所在目录，而非项目根目录
+6. **快速选项按钮** - 支持通过 `options` 参数提供多个解决方案供用户快速选择，点击后填充到输入框
+
+### 工具参数说明
+
+| 参数 | 类型 | 必需 | 说明 |
+|-----|------|------|------|
+| `project_directory` | string | ✅ | 项目目录的完整路径 |
+| `summary` | string | ✅ | 简短的变更摘要或问题描述 |
+| `current_file` | string | ❌ | 当前编辑的文件路径，用于文件选择器的初始目录 |
+| `options` | array | ❌ | 解决方案选项列表，例如 `["方案A: xxx", "方案B: yyy"]` |
 
 ## Installation (Cursor)
 
@@ -142,7 +152,9 @@ Here's an example of how the AI assistant would call the `interactive_feedback` 
   <arguments>
     {
       "project_directory": "/path/to/your/project",
-      "summary": "I've implemented the changes you requested and refactored the main module."
+      "summary": "I've implemented the changes you requested and refactored the main module.",
+      "current_file": "/path/to/your/project/src/main.py",
+      "options": ["方案A: 使用xxx实现", "方案B: 使用yyy实现", "继续当前方案"]
     }
   </arguments>
 </use_mcp_tool>
