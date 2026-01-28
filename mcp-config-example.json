@@ -1,0 +1,21 @@
+{
+  "interactive-feedback-mcp": {
+    "command": "uv",
+    "args": [
+      "--directory",
+      "D:\\lt\\interactive-feedback-mcp",
+      "run",
+      "server.py"
+    ],
+    "timeout": 900,
+    "env": {
+      "INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS": "600",
+      "PYTHONUNBUFFERED": "1",
+      "PYTHONUTF8": "1"
+    },
+    "autoApprove": [
+      "interactive_feedback"
+    ],
+    "type": "stdio"
+  }
+}

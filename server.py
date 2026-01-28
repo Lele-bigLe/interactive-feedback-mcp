@@ -62,13 +62,16 @@ def launch_feedback_ui(project_directory: str, summary: str, current_file: Optio
             args,
             check=False,
             shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            close_fds=True
+            close_fds=True,
+            timeout=timeout_seconds + 30  # 给UI额外30秒的启动时间
         )
         if result.returncode != 0:
-            raise Exception(f"Failed to launch feedback UI: {result.returncode}")
+            # 记录错误信息以便调试
+            error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else "Unknown error"
+            raise Exception(f"Failed to launch feedback UI (exit code {result.returncode}): {error_msg}")
 
         # Read the result from the temporary file
         with open(output_file, 'r') as f:
@@ -92,21 +95,48 @@ def interactive_feedback(
 ) -> Dict[str, str]:
     """
     Request interactive feedback for a given project directory and summary.
-    
+
     此工具会启动一个交互式反馈界面，等待用户输入。如果用户在超时时间内未响应，
     工具会自动返回一个特殊标记，提示需要重新调用以保持会话活跃。
-    
+
     超时时间可通过环境变量 INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS 配置，默认600秒。
-    
+
     可以通过 options 参数提供多个解决方案供用户快速选择。
     """
     return launch_feedback_ui(
-        first_line(project_directory), 
+        first_line(project_directory),
         first_line(summary),
         first_line(current_file) if current_file else None,
         INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS,
         options
     )
+
+@mcp.tool()
+def health_check() -> Dict[str, str]:
+    """
+    健康检查工具 - 验证 MCP 服务器和依赖是否正常工作
+    """
+    checks = {}
+
+    # 检查 Python 版本
+    checks["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+    # 检查 PySide6
+    try:
+        import PySide6
+        checks["pyside6"] = "✓ 已安装"
+    except ImportError:
+        checks["pyside6"] = "✗ 未安装"
+
+    # 检查 feedback_ui.py
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    feedback_ui_path = os.path.join(script_dir, "feedback_ui.py")
+    checks["feedback_ui"] = "✓ 存在" if os.path.exists(feedback_ui_path) else "✗ 不存在"
+
+    # 检查超时配置
+    checks["timeout_seconds"] = str(INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS)
+
+    return checks
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
