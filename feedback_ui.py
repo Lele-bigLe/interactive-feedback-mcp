@@ -41,7 +41,8 @@ def parse_file_references(text: str, project_directory: str) -> List[Tuple[str, 
     返回: [(文件路径, 起始行, 结束行), ...]
     """
     # 匹配 @文件名 或 @文件名#行号 或 @文件名#起始行-结束行
-    pattern = r'@([^\s#]+)(?:#(\d+)(?:-(\d+))?)?'
+    # [^#\s]+ 匹配除 # 和空白字符外的所有字符（包括路径分隔符）
+    pattern = r'@([^#\s]+)(?:#(\d+)(?:-(\d+))?)?'
     matches = re.finditer(pattern, text)
 
     references = []
