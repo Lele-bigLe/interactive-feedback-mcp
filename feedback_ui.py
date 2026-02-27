@@ -13,36 +13,41 @@ from typing import Optional, TypedDict, List, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTextEdit, QGroupBox, QFileDialog, QSizePolicy
+    QLabel, QPushButton, QTextEdit, QGroupBox, QSizePolicy, QFileDialog
 )
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSettings
 from PySide6.QtGui import (
-    QIcon, QKeyEvent, QPalette, QColor, 
-    QPixmap
+    QIcon, QKeyEvent, QPalette, QColor,
+    QPixmap, QImage, QDragEnterEvent, QDropEvent
 )
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+
 
 class FeedbackResult(TypedDict):
-    logs: str  # 保留字段，但不再使用命令日志
+    logs: str
     interactive_feedback: str
-    image_path: str  # 保持兼容，存储第一张图片路径
-    image_paths: List[str]  # 多图片路径列表
-    context_files: List[str]  # 上下文文件路径列表
+    image_paths: List[str]  # 图片路径列表
+    selected_options: List[str]  # 用户选择的选项列表
     timeout_triggered: bool  # 是否因超时触发重新调用
+
 
 def parse_file_references(text: str, project_directory: str) -> List[Tuple[str, Optional[int], Optional[int]]]:
     """解析文本中的文件引用
 
     支持的格式：
-    - @文件名 - 引用整个文件
-    - @文件名#行号 - 引用特定行
-    - @文件名#起始行-结束行 - 引用行范围
+    - @相对路径 - 引用整个文件
+    - @相对路径#行号 - 引用特定行
+    - @相对路径#起始行-结束行 - 引用行范围
+
+    示例：
+    - @src/views/dataAdmin/uploadHead/index.vue
+    - @src/views/dataAdmin/uploadHead/index.vue#61
+    - @src/views/dataAdmin/uploadHead/index.vue#61-70
 
     返回: [(文件路径, 起始行, 结束行), ...]
     """
-    # 匹配 @文件名 或 @文件名#行号 或 @文件名#起始行-结束行
-    # [^#\s]+ 匹配除 # 和空白字符外的所有字符（包括路径分隔符）
-    pattern = r'@([^#\s]+)(?:#(\d+)(?:-(\d+))?)?'
+    # 匹配 @路径 或 @路径#行号 或 @路径#起始行-结束行
+    # 支持完整相对路径，包含 / 和 \ 分隔符
+    pattern = r'@([\w./\\][\w./\\-]*(?:\.\w+))(?:#(\d+)(?:-(\d+))?)?'
     matches = re.finditer(pattern, text)
 
     references = []
@@ -51,81 +56,80 @@ def parse_file_references(text: str, project_directory: str) -> List[Tuple[str, 
         start_line = int(match.group(2)) if match.group(2) else None
         end_line = int(match.group(3)) if match.group(3) else start_line
 
-        # 尝试解析文件路径
-        file_path = filename
-        if not os.path.isabs(filename):
-            # 相对路径，相对于项目目录
+        # 统一路径分隔符
+        filename = filename.replace('\\', '/')
+
+        # 构建完整路径
+        if os.path.isabs(filename):
+            file_path = filename
+        else:
             file_path = os.path.join(project_directory, filename)
+
+        # 标准化路径
+        file_path = os.path.normpath(file_path)
 
         if os.path.exists(file_path):
             references.append((file_path, start_line, end_line))
 
     return references
 
-def expand_file_references(text: str, project_directory: str) -> Tuple[str, List[str]]:
-    """展开文本中的文件引用，返回展开后的文本和引用的文件列表
 
-    返回: (展开后的文本, 引用的文件列表)
-    """
+def expand_file_references(text: str, project_directory: str) -> str:
+    """展开文本中的文件引用，返回包含引用信息的文本"""
     references = parse_file_references(text, project_directory)
     if not references:
-        return text, []
+        return text
 
     expanded_text = text
-    referenced_files = []
 
     for file_path, start_line, end_line in references:
-        referenced_files.append(file_path)
+        # 计算相对路径用于显示
+        try:
+            rel_path = os.path.relpath(file_path, project_directory).replace('\\', '/')
+        except ValueError:
+            rel_path = file_path
 
-        # 构建引用标记
         if start_line is None:
-            ref_marker = f"@{os.path.basename(file_path)}"
-            ref_info = f"\n\n[引用文件: {file_path}]"
+            ref_info = f"\n\n[引用文件: {rel_path}]"
         elif end_line == start_line:
-            ref_marker = f"@{os.path.basename(file_path)}#{start_line}"
-            ref_info = f"\n\n[引用: {file_path}#{start_line}]"
+            ref_info = f"\n\n[引用: {rel_path}#{start_line}]"
         else:
-            ref_marker = f"@{os.path.basename(file_path)}#{start_line}-{end_line}"
-            ref_info = f"\n\n[引用: {file_path}#{start_line}-{end_line}]"
+            ref_info = f"\n\n[引用: {rel_path}#{start_line}-{end_line}]"
 
-        # 替换引用标记为引用信息
-        expanded_text = expanded_text.replace(ref_marker, ref_info)
+        # 在文本末尾追加引用信息（不替换原始文本）
+        expanded_text += ref_info
 
-    return expanded_text, referenced_files
+    return expanded_text
+
 
 def set_dark_title_bar(widget: QWidget, dark_title_bar: bool) -> None:
-    # Ensure we're on Windows
     if sys.platform != "win32":
         return
 
     from ctypes import windll, c_uint32, byref
 
-    # Get Windows build number
     build_number = sys.getwindowsversion().build
-    if build_number < 17763:  # Windows 10 1809 minimum
+    if build_number < 17763:
         return
 
-    # Check if the widget's property already matches the setting
     dark_prop = widget.property("DarkTitleBar")
     if dark_prop is not None and dark_prop == dark_title_bar:
         return
 
-    # Set the property (True if dark_title_bar != 0, False otherwise)
     widget.setProperty("DarkTitleBar", dark_title_bar)
 
-    # Load dwmapi.dll and call DwmSetWindowAttribute
     dwmapi = windll.dwmapi
-    hwnd = widget.winId()  # Get the window handle
-    attribute = 20 if build_number >= 18985 else 19  # Use newer attribute for newer builds
-    c_dark_title_bar = c_uint32(dark_title_bar)  # Convert to C-compatible uint32
+    hwnd = widget.winId()
+    attribute = 20 if build_number >= 18985 else 19
+    c_dark_title_bar = c_uint32(dark_title_bar)
     dwmapi.DwmSetWindowAttribute(hwnd, attribute, byref(c_dark_title_bar), 4)
 
-    # HACK: Create a 1x1 pixel frameless window to force redraw
     temp_widget = QWidget(None, Qt.FramelessWindowHint)
     temp_widget.resize(1, 1)
     temp_widget.move(widget.pos())
     temp_widget.show()
-    temp_widget.deleteLater()  # Safe deletion in Qt event loop
+    temp_widget.deleteLater()
+
 
 def get_dark_mode_palette(app: QApplication):
     darkPalette = app.palette()
@@ -152,67 +156,29 @@ def get_dark_mode_palette(app: QApplication):
     darkPalette.setColor(QPalette.PlaceholderText, QColor(127, 127, 127))
     return darkPalette
 
+
 class FeedbackTextEdit(QTextEdit):
-    """自定义文本编辑器，只接受纯文本粘贴"""
+    """自定义文本编辑器，支持纯文本粘贴和图片粘贴"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 设置为纯文本模式
         self.setAcceptRichText(False)
+        self.setAcceptDrops(True)
+
+    def _get_feedback_ui(self):
+        """查找父级 FeedbackUI 实例"""
+        parent = self.parent()
+        while parent and not isinstance(parent, FeedbackUI):
+            parent = parent.parent()
+        return parent
 
     def insertFromMimeData(self, source):
-        """重写粘贴方法，只接受纯文本"""
-        if source.hasText():
-            # 禁用更新以提高性能
-            self.setUpdatesEnabled(False)
-            try:
-                # 只插入纯文本，忽略任何格式
-                self.insertPlainText(source.text())
-            finally:
-                # 确保重新启用更新
-                self.setUpdatesEnabled(True)
-                self.update()
-        else:
-            # 如果没有文本，调用父类方法
-            super().insertFromMimeData(source)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
-            # Find the parent FeedbackUI instance and call submit
-            parent = self.parent()
-            while parent and not isinstance(parent, FeedbackUI):
-                parent = parent.parent()
-            if parent:
-                parent._submit_feedback()
-        else:
-            super().keyPressEvent(event)
-
-class ImageLabel(QLabel):
-    """支持粘贴和拖放的图片标签"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.image_loaded_callback = None  # 回调函数，用于通知父组件图片已加载
-
-    def set_image_loaded_callback(self, callback):
-        """设置图片加载后的回调函数"""
-        self.image_loaded_callback = callback
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        """拖拽进入事件"""
-        if event.mimeData().hasUrls() or event.mimeData().hasImage():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event: QDropEvent):
-        """拖放事件"""
-        if event.mimeData().hasImage():
-            # 从拖拽中获取图片
-            image_data = event.mimeData().imageData()
-            if image_data:
-                # 转换为QPixmap
-                from PySide6.QtGui import QImage
+        """重写粘贴方法：支持图片粘贴和纯文本"""
+        # 优先处理图片数据（剪贴板截图）
+        if source.hasImage():
+            ui = self._get_feedback_ui()
+            if ui:
+                image_data = source.imageData()
                 if isinstance(image_data, QImage):
                     pixmap = QPixmap.fromImage(image_data)
                 elif isinstance(image_data, QPixmap):
@@ -220,280 +186,137 @@ class ImageLabel(QLabel):
                 else:
                     pixmap = QPixmap()
                 if not pixmap.isNull():
-                    self._load_pixmap(pixmap, "拖放的图片")
-        elif event.mimeData().hasUrls():
-            # 拖放文件
-            urls = event.mimeData().urls()
-            if urls:
-                file_path = urls[0].toLocalFile()
-                if file_path:
-                    self._load_from_file(file_path)
-        event.acceptProposedAction()
-
-    def keyPressEvent(self, event: QKeyEvent):
-        """键盘事件：支持 Ctrl+V 粘贴"""
-        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
-            self._paste_from_clipboard()
+                    ui._add_image_from_pixmap(pixmap, "剪贴板截图")
+                    return
+        # 处理文件URL（拖放图片文件）
+        if source.hasUrls():
+            ui = self._get_feedback_ui()
+            if ui:
+                for url in source.urls():
+                    file_path = url.toLocalFile()
+                    if file_path:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                            pixmap = QPixmap(file_path)
+                            if not pixmap.isNull():
+                                ui._add_image_from_pixmap(pixmap, file_path)
+                return
+        # 纯文本粘贴
+        if source.hasText():
+            self.insertPlainText(source.text())
         else:
-            super().keyPressEvent(event)
+            super().insertFromMimeData(source)
 
-    def mousePressEvent(self, event):
-        """鼠标点击事件：点击后获得焦点，支持粘贴"""
-        self.setFocus()
-        super().mousePressEvent(event)
-
-    def _paste_from_clipboard(self):
-        """从剪贴板粘贴图片"""
-        clipboard = QApplication.clipboard()
-        if clipboard.mimeData().hasImage():
-            pixmap = clipboard.pixmap()
-            if not pixmap.isNull():
-                self._load_pixmap(pixmap, "粘贴的图片")
-        elif clipboard.mimeData().hasUrls():
-            # 剪贴板中有文件路径
-            urls = clipboard.mimeData().urls()
-            if urls:
-                file_path = urls[0].toLocalFile()
-                if file_path and os.path.exists(file_path):
-                    self._load_from_file(file_path)
-
-    def _load_pixmap(self, pixmap: QPixmap, source: str):
-        """加载QPixmap图片"""
-        if not pixmap.isNull():
-            if self.image_loaded_callback:
-                self.image_loaded_callback(pixmap, source)
-            else:
-                # 如果没有回调，直接显示
-                self._update_display(pixmap)
-
-    def _load_from_file(self, file_path: str):
-        """从文件加载图片"""
-        if os.path.exists(file_path):
-            pixmap = QPixmap(file_path)
-            if not pixmap.isNull():
-                if self.image_loaded_callback:
-                    self.image_loaded_callback(pixmap, file_path)
-                else:
-                    self._update_display(pixmap)
-
-    def _update_display(self, pixmap: QPixmap):
-        """更新显示"""
-        label_width = self.width() if self.width() > 0 else 400
-        label_height = self.height() if self.height() > 0 else 300
-        scaled_pixmap = pixmap.scaled(
-            label_width,
-            label_height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-        self.setPixmap(scaled_pixmap)
-        self.setText("")
-
-class ImageDropArea(QTextEdit):
-    """支持拖放和粘贴的多图片区域"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setReadOnly(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.image_paths: List[str] = []
-        self.image_added_callback = None  # 图片添加回调
-        self.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴")
-        # 预定义样式表
-        self._empty_style = """
-            border: 2px dashed #555;
-            border-radius: 8px;
-            background-color: #2a2a2a;
-            color: #888;
-            font-size: 13px;
-            padding: 8px;
-        """
-        self._filled_style = """
-            border: 2px solid #42a2da;
-            border-radius: 8px;
-            background-color: #2a2a2a;
-            color: #fff;
-            font-size: 13px;
-            padding: 8px;
-        """
-    
     def dragEnterEvent(self, event: QDragEnterEvent):
-        """拖拽进入事件"""
-        if event.mimeData().hasUrls() or event.mimeData().hasImage():
+        """拖拽进入：接受图片文件"""
+        if event.mimeData().hasImage() or event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
-            event.ignore()
-    
+            super().dragEnterEvent(event)
+
     def dropEvent(self, event: QDropEvent):
-        """拖放事件"""
-        if event.mimeData().hasImage():
-            # 拖放的是图片数据
-            image_data = event.mimeData().imageData()
-            if image_data:
-                from PySide6.QtGui import QImage
+        """拖放事件：处理图片文件拖放"""
+        mime = event.mimeData()
+        ui = self._get_feedback_ui()
+        if ui:
+            if mime.hasImage():
+                image_data = mime.imageData()
                 if isinstance(image_data, QImage):
                     pixmap = QPixmap.fromImage(image_data)
                 elif isinstance(image_data, QPixmap):
                     pixmap = image_data
                 else:
                     pixmap = QPixmap()
-                if not pixmap.isNull() and self.image_added_callback:
-                    self.image_added_callback(pixmap, "拖放的图片")
-        elif event.mimeData().hasUrls():
-            # 拖放的是文件
-            for url in event.mimeData().urls():
-                file_path = url.toLocalFile()
-                if file_path and os.path.exists(file_path):
-                    # 检查是否是图片文件
-                    ext = os.path.splitext(file_path)[1].lower()
-                    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
-                        pixmap = QPixmap(file_path)
-                        if not pixmap.isNull() and self.image_added_callback:
-                            self.image_added_callback(pixmap, file_path)
-        event.acceptProposedAction()
-    
+                if not pixmap.isNull():
+                    ui._add_image_from_pixmap(pixmap, "拖放的图片")
+                    event.acceptProposedAction()
+                    return
+            if mime.hasUrls():
+                handled = False
+                for url in mime.urls():
+                    file_path = url.toLocalFile()
+                    if file_path:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                            pixmap = QPixmap(file_path)
+                            if not pixmap.isNull():
+                                ui._add_image_from_pixmap(pixmap, file_path)
+                                handled = True
+                if handled:
+                    event.acceptProposedAction()
+                    return
+        super().dropEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent):
-        """键盘事件：支持 Ctrl+V 粘贴"""
-        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
-            self._paste_from_clipboard()
+        if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
+            ui = self._get_feedback_ui()
+            if ui:
+                ui._submit_feedback()
         else:
             super().keyPressEvent(event)
-    
-    def mousePressEvent(self, event):
-        """鼠标点击事件：点击后获得焦点"""
-        self.setFocus()
-        super().mousePressEvent(event)
-    
-    def _paste_from_clipboard(self):
-        """从剪贴板粘贴图片"""
-        clipboard = QApplication.clipboard()
-        if clipboard.mimeData().hasImage():
-            pixmap = clipboard.pixmap()
-            if not pixmap.isNull() and self.image_added_callback:
-                self.image_added_callback(pixmap, "粘贴的图片")
-        elif clipboard.mimeData().hasUrls():
-            for url in clipboard.mimeData().urls():
-                file_path = url.toLocalFile()
-                if file_path and os.path.exists(file_path):
-                    ext = os.path.splitext(file_path)[1].lower()
-                    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
-                        pixmap = QPixmap(file_path)
-                        if not pixmap.isNull() and self.image_added_callback:
-                            self.image_added_callback(pixmap, file_path)
-    
-    def update_display(self, image_paths: List[str]):
-        """更新显示的图片列表"""
-        self.image_paths = image_paths
-        self.setUpdatesEnabled(False)
-        try:
-            if image_paths:
-                display_text = "\n".join([f"🖼️ {os.path.basename(p) if os.path.exists(p) else p}" for p in image_paths])
-                self.setPlainText(display_text)
-                self.setStyleSheet(self._filled_style)
-            else:
-                self.clear()
-                self.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴\n支持多张图片")
-                self.setStyleSheet(self._empty_style)
-        finally:
-            self.setUpdatesEnabled(True)
-            self.update()
 
-class ContextFileList(QTextEdit):
-    """支持拖放的上下文文件列表"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setReadOnly(True)
-        self.files: List[str] = []
-        self.files_added_callback = None  # 文件添加回调
-        self.setPlaceholderText("拖放文件/文件夹到这里")
-    
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        """拖拽进入事件"""
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-    
-    def dropEvent(self, event: QDropEvent):
-        """拖放事件"""
-        if event.mimeData().hasUrls():
-            new_files = []
-            for url in event.mimeData().urls():
-                file_path = url.toLocalFile()
-                if file_path and os.path.exists(file_path):
-                    # 如果是文件夹，获取其中所有文件
-                    if os.path.isdir(file_path):
-                        new_files.append(file_path)
-                    else:
-                        new_files.append(file_path)
-            
-            if new_files and self.files_added_callback:
-                self.files_added_callback(new_files)
-            
-            event.acceptProposedAction()
-    
-    def update_display(self, files: List[str]):
-        """更新显示的文件列表"""
-        self.files = files
-        self.setUpdatesEnabled(False)
-        try:
-            if files:
-                display_text = "\n".join([f"📄 {f}" if os.path.isfile(f) else f"📁 {f}" for f in files])
-                self.setPlainText(display_text)
-            else:
-                self.clear()
-                self.setPlaceholderText("拖放文件/文件夹到这里，或使用上方按钮添加\n支持多选")
-        finally:
-            self.setUpdatesEnabled(True)
-            self.update()
 
 class FeedbackUI(QMainWindow):
+    # 预定义超时样式，避免重复创建
+    _TIMEOUT_STYLE_NORMAL = """
+        font-size: 12px;
+        color: #aaa;
+        padding: 4px 8px;
+        background-color: #333;
+        border-radius: 4px;
+    """
+    _TIMEOUT_STYLE_WARNING = """
+        font-size: 12px;
+        color: #ffaa66;
+        padding: 4px 8px;
+        background-color: #4a3a2a;
+        border-radius: 4px;
+    """
+    _TIMEOUT_STYLE_DANGER = """
+        font-size: 12px;
+        color: #ff6666;
+        padding: 4px 8px;
+        background-color: #4a2a2a;
+        border-radius: 4px;
+        font-weight: bold;
+    """
+    _TIMEOUT_STYLE_PAUSED = """
+        font-size: 12px;
+        color: #ffc;
+        padding: 4px 8px;
+        background-color: #5a4a3a;
+        border-radius: 4px;
+    """
+
     def __init__(self, project_directory: str, prompt: str, current_file: Optional[str] = None, timeout_seconds: int = 600, options: Optional[List[str]] = None):
         super().__init__()
         self.project_directory = project_directory
         self.prompt = prompt
-        self.current_file = current_file  # 当前编辑文件路径
-        self.timeout_seconds = timeout_seconds  # 超时时间
-        self.start_time = time.time()  # 记录开始时间
-        self.timeout_triggered = False  # 超时标志
-        self.options = options or []  # 解决方案选项列表
-
-        self.feedback_result = None
-        self.image_paths: List[str] = []  # 多图片路径列表
-        self.image_pixmaps: List[QPixmap] = []  # 存储原始图片列表
-        self.context_files: List[str] = []  # 上下文文件路径列表
+        self.current_file = current_file
+        self.timeout_seconds = timeout_seconds
+        self.start_time = time.time()
+        self.timeout_triggered = False
+        self.options = options or []
+        self.selected_options: List[str] = []  # 已选中的选项
+        self.image_paths: List[str] = []  # 图片路径列表
         self.temp_image_counter = 0  # 临时图片计数器
 
-        # 预定义样式表常量，避免重复创建
-        self._image_list_empty_style = """
-            border: 2px dashed #555;
-            border-radius: 8px;
-            background-color: #2a2a2a;
-            color: #888;
-            font-size: 13px;
-            padding: 8px;
-        """
-        self._image_list_filled_style = """
-            border: 2px solid #42a2da;
-            border-radius: 8px;
-            background-color: #2a2a2a;
-            color: #fff;
-            font-size: 13px;
-            padding: 8px;
-        """
+        self.feedback_result = None
 
-        # 获取项目名称（用于显示）
+        # 超时样式状态缓存，避免重复设置样式
+        self._current_timeout_style = None
+
+        # 获取项目名称
         self.project_name = os.path.basename(os.path.normpath(project_directory))
-        self.setWindowTitle(f"Interactive Feedback - [{self.project_name}]")
+        self.setWindowTitle(f"交互式反馈 - [{self.project_name}]")
         script_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(script_dir, "images", "feedback.png")
         self.setWindowIcon(QIcon(icon_path))
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-        
+
         self.settings = QSettings("InteractiveFeedbackMCP", "InteractiveFeedbackMCP")
-        
-        # Load general UI settings for the main window (geometry, state)
+
+        # 加载窗口几何信息
         self.settings.beginGroup("MainWindow_General")
         geometry = self.settings.value("geometry")
         if geometry:
@@ -507,34 +330,10 @@ class FeedbackUI(QMainWindow):
         state = self.settings.value("windowState")
         if state:
             self.restoreState(state)
-        self.settings.endGroup() # End "MainWindow_General" group
-        
-        # Load project-specific settings
-        self.project_group_name = get_project_settings_group(self.project_directory)
-        self.settings.beginGroup(self.project_group_name)
-        image_section_visible = self.settings.value("imageSectionVisible", False, type=bool)  # 图片区域可见性
-        context_section_visible = self.settings.value("contextSectionVisible", False, type=bool)  # 上下文区域可见性
-        self.settings.endGroup() # End project-specific group
+        self.settings.endGroup()
 
         self._create_ui()
-        
-        # Set image section visibility AFTER _create_ui has created relevant widgets
-        self.image_group.setVisible(image_section_visible)
-        if image_section_visible:
-            self.toggle_image_button.setText("➖ 图片")
-        else:
-            self.toggle_image_button.setText("🖼️ 图片")
-        
-        # Set context section visibility AFTER _create_ui has created relevant widgets
-        self.context_group.setVisible(context_section_visible)
-        if context_section_visible:
-            self.toggle_context_button.setText("➖ 上下文引用")
-        else:
-            self.toggle_context_button.setText("📎 上下文引用")
-
         set_dark_title_bar(self, True)
-
-        # 启动超时计时器
         self._setup_timeout_timer()
 
     def _apply_styles(self):
@@ -557,18 +356,7 @@ class FeedbackUI(QMainWindow):
             QPushButton:pressed {
                 background-color: #2d2d2d;
             }
-            
-            /* 切换按钮特殊样式 */
-            QPushButton#toggleButton {
-                background-color: #2a4a6a;
-                border: 1px solid #3a5a7a;
-                text-align: left;
-                padding-left: 12px;
-            }
-            QPushButton#toggleButton:hover {
-                background-color: #3a5a8a;
-            }
-            
+
             /* 主要操作按钮 */
             QPushButton#primaryButton {
                 background-color: #2a82da;
@@ -577,16 +365,7 @@ class FeedbackUI(QMainWindow):
             QPushButton#primaryButton:hover {
                 background-color: #3a92ea;
             }
-            
-            /* 危险操作按钮 */
-            QPushButton#dangerButton {
-                background-color: #8a3a3a;
-                border: 1px solid #9a4a4a;
-            }
-            QPushButton#dangerButton:hover {
-                background-color: #9a4a4a;
-            }
-            
+
             /* 分组框样式 */
             QGroupBox {
                 font-size: 14px;
@@ -603,23 +382,7 @@ class FeedbackUI(QMainWindow):
                 padding: 0 8px;
                 color: #aaa;
             }
-            
-            /* 输入框样式 */
-            QLineEdit {
-                background-color: #3a3a3a;
-                border: 1px solid #555;
-                border-radius: 6px;
-                padding: 8px 12px;
-                color: #fff;
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border-color: #2a82da;
-            }
-            QLineEdit::placeholder {
-                color: #888;
-            }
-            
+
             /* 文本编辑器样式 */
             QTextEdit {
                 background-color: #2a2a2a;
@@ -632,25 +395,7 @@ class FeedbackUI(QMainWindow):
             QTextEdit:focus {
                 border-color: #2a82da;
             }
-            
-            /* 复选框样式 */
-            QCheckBox {
-                color: #ccc;
-                font-size: 13px;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 4px;
-                border: 1px solid #555;
-                background-color: #3a3a3a;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #2a82da;
-                border-color: #2a82da;
-            }
-            
+
             /* 标签样式 */
             QLabel {
                 color: #ddd;
@@ -671,17 +416,15 @@ class FeedbackUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setSpacing(12)  # 增加组件间距
-        layout.setContentsMargins(16, 16, 16, 16)  # 增加边距
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
 
-        # 全局样式表
         self._apply_styles()
 
         # 项目标识和超时计时器区域
         project_info_layout = QHBoxLayout()
         project_info_layout.setSpacing(12)
-        
-        # 项目名称标签
+
         self.project_label = QLabel(f"📁 {self.project_name}")
         self.project_label.setStyleSheet("""
             font-size: 14px;
@@ -693,20 +436,14 @@ class FeedbackUI(QMainWindow):
         """)
         self.project_label.setToolTip(f"项目路径: {self.project_directory}")
         project_info_layout.addWidget(self.project_label)
-        
+
         project_info_layout.addStretch()
-        
+
         # 超时倒计时标签
         self.timeout_label = QLabel()
-        self.timeout_label.setStyleSheet("""
-            font-size: 12px;
-            color: #aaa;
-            padding: 4px 8px;
-            background-color: #333;
-            border-radius: 4px;
-        """)
+        self.timeout_label.setStyleSheet(self._TIMEOUT_STYLE_NORMAL)
         project_info_layout.addWidget(self.timeout_label)
-        
+
         # 重新计时按钮
         self.reset_timer_button = QPushButton("🔄 重新计时")
         self.reset_timer_button.setFixedWidth(90)
@@ -725,7 +462,7 @@ class FeedbackUI(QMainWindow):
         """)
         self.reset_timer_button.clicked.connect(self._reset_timeout)
         project_info_layout.addWidget(self.reset_timer_button)
-        
+
         # 停止计时按钮
         self.stop_timer_button = QPushButton("⏹️ 停止")
         self.stop_timer_button.setFixedWidth(70)
@@ -744,142 +481,36 @@ class FeedbackUI(QMainWindow):
         """)
         self.stop_timer_button.clicked.connect(self._stop_timeout)
         project_info_layout.addWidget(self.stop_timer_button)
-        
+
         layout.addLayout(project_info_layout)
 
-        # Feedback section with adjusted height
+        # 反馈区域
         self.feedback_group = QGroupBox("💬 反馈")
         feedback_layout = QVBoxLayout(self.feedback_group)
         feedback_layout.setSpacing(10)
 
-        # Short description label (from self.prompt)
+        # 说明标签
         self.description_label = QLabel(self.prompt)
         self.description_label.setWordWrap(True)
         self.description_label.setObjectName("descriptionLabel")
         feedback_layout.addWidget(self.description_label)
 
-        # 可选区域按钮行（水平排列）
-        toggle_layout = QHBoxLayout()
-        toggle_layout.setSpacing(8)
-        
-        # Toggle Image Section Button
-        self.toggle_image_button = QPushButton("🖼️ 图片")
-        self.toggle_image_button.setObjectName("toggleButton")
-        self.toggle_image_button.clicked.connect(self._toggle_image_section)
-        toggle_layout.addWidget(self.toggle_image_button)
-        
-        # Toggle Context Section Button
-        self.toggle_context_button = QPushButton("📎 上下文引用")
-        self.toggle_context_button.setObjectName("toggleButton")
-        self.toggle_context_button.clicked.connect(self._toggle_context_section)
-        toggle_layout.addWidget(self.toggle_context_button)
-        
-        toggle_layout.addStretch()
-        feedback_layout.addLayout(toggle_layout)
-
-        # 图片区域
-        self.image_group = QGroupBox("🖼️ 图片（可选，支持多张）")
-        image_layout = QVBoxLayout(self.image_group)
-        image_layout.setSpacing(8)
-        
-        # 图片操作按钮行
-        image_btn_layout = QHBoxLayout()
-        image_btn_layout.setSpacing(6)
-        
-        select_image_button = QPushButton("📂 选择图片")
-        select_image_button.clicked.connect(self._select_image_file)
-        paste_image_button = QPushButton("📋 粘贴")
-        paste_image_button.setObjectName("primaryButton")
-        paste_image_button.clicked.connect(self._paste_image)
-        clear_image_button = QPushButton("🗑️ 清除全部")
-        clear_image_button.setObjectName("dangerButton")
-        clear_image_button.clicked.connect(self._clear_image)
-        
-        image_btn_layout.addWidget(select_image_button)
-        image_btn_layout.addWidget(paste_image_button)
-        image_btn_layout.addStretch()
-        image_btn_layout.addWidget(clear_image_button)
-        image_layout.addLayout(image_btn_layout)
-        
-        # 图片列表（支持粘贴和拖放）
-        self.image_list = ImageDropArea()
-        self.image_list.setMinimumHeight(100)
-        self.image_list.setMaximumHeight(200)
-        self.image_list.setStyleSheet("""
-            border: 2px dashed #555; 
-            border-radius: 8px;
-            background-color: #2a2a2a; 
-            color: #888;
-            font-size: 13px;
-            padding: 8px;
-        """)
-        self.image_list.setPlaceholderText("🖼️ 拖放图片到这里，或按 Ctrl+V 粘贴\n支持多张图片")
-        self.image_list.image_added_callback = self._on_image_added
-        image_layout.addWidget(self.image_list)
-        
-        self.image_group.setVisible(False)
-        feedback_layout.addWidget(self.image_group)
-
-        # 上下文文件区域
-        self.context_group = QGroupBox("📎 上下文引用（可选）")
-        context_layout = QVBoxLayout(self.context_group)
-        context_layout.setSpacing(8)
-        
-        # 上下文文件操作按钮行
-        context_btn_layout = QHBoxLayout()
-        context_btn_layout.setSpacing(6)
-        add_file_button = QPushButton("📄 添加文件")
-        add_file_button.clicked.connect(self._add_context_file)
-        add_folder_button = QPushButton("📁 添加文件夹")
-        add_folder_button.clicked.connect(self._add_context_folder)
-        clear_context_button = QPushButton("🗑️")
-        clear_context_button.setObjectName("dangerButton")
-        clear_context_button.setFixedWidth(40)
-        clear_context_button.clicked.connect(self._clear_context_files)
-        
-        context_btn_layout.addWidget(add_file_button)
-        context_btn_layout.addWidget(add_folder_button)
-        context_btn_layout.addStretch()
-        context_btn_layout.addWidget(clear_context_button)
-        context_layout.addLayout(context_btn_layout)
-        
-        # 上下文文件列表（支持拖放）
-        self.context_list = ContextFileList()
-        self.context_list.setMinimumHeight(80)
-        self.context_list.setMaximumHeight(150)
-        self.context_list.setStyleSheet("""
-            border: 2px dashed #555; 
-            border-radius: 8px;
-            background-color: #2a2a2a; 
-            color: #888;
-            font-size: 13px;
-            padding: 8px;
-        """)
-        self.context_list.setPlaceholderText("📂 拖放文件/文件夹到这里\n或使用上方按钮添加")
-        self.context_list.files_added_callback = self._on_context_files_added
-        context_layout.addWidget(self.context_list)
-        
-        self.context_group.setVisible(False)
-        feedback_layout.addWidget(self.context_group)
-
-        # 解决方案选项区域（如果有选项的话）
+        # 解决方案选项区域（垂直布局，每个选项单独一行）
         if self.options:
-            self.options_group = QGroupBox("💡 快速选择（点击填充到输入框）")
-            options_layout = QHBoxLayout(self.options_group)  # 改为水平布局
-            options_layout.setSpacing(8)
+            self.options_group = QGroupBox("💡 快速选择（点击追加到输入框，再次点击取消选择）")
+            options_layout = QVBoxLayout(self.options_group)
+            options_layout.setSpacing(6)
 
-            # 预定义样式表，避免重复创建
-            option_button_style = """
+            # 选项按钮样式（未选中）
+            self._option_style_normal = """
                 QPushButton {
-                    text-align: center;
-                    padding: 8px 12px;
+                    text-align: left;
+                    padding: 8px 14px;
                     background-color: #2a4a3a;
                     border: 1px solid #3a6a4a;
-                    border-radius: 16px;
+                    border-radius: 8px;
                     color: #9fc;
-                    font-size: 12px;
-                    min-width: 60px;
-                    max-width: 150px;
+                    font-size: 13px;
                 }
                 QPushButton:hover {
                     background-color: #3a5a4a;
@@ -890,19 +521,37 @@ class FeedbackUI(QMainWindow):
                     background-color: #1a3a2a;
                 }
             """
+            # 选项按钮样式（已选中）
+            self._option_style_selected = """
+                QPushButton {
+                    text-align: left;
+                    padding: 8px 14px;
+                    background-color: #1a5a3a;
+                    border: 2px solid #4aaa6a;
+                    border-radius: 8px;
+                    color: #bfe;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #2a6a4a;
+                    border-color: #5aba7a;
+                }
+                QPushButton:pressed {
+                    background-color: #0a4a2a;
+                }
+            """
 
             self.option_buttons = []
             for i, option in enumerate(self.options):
-                btn = QPushButton(f"{option}")
+                btn = QPushButton(f"  {option}")
                 btn.setToolTip(f"点击选择: {option}")
-                btn.setStyleSheet(option_button_style)
-                btn.setMaximumWidth(150)
+                btn.setStyleSheet(self._option_style_normal)
                 btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                btn.clicked.connect(lambda checked, opt=option: self._select_option(opt))
+                btn.clicked.connect(lambda checked, opt=option, b=btn: self._toggle_option(opt, b))
                 options_layout.addWidget(btn)
                 self.option_buttons.append(btn)
 
-            options_layout.addStretch()  # 添加弹性空间
             feedback_layout.addWidget(self.options_group)
 
         # 反馈文本输入区
@@ -911,7 +560,14 @@ class FeedbackUI(QMainWindow):
         row_height = font_metrics.height()
         padding = self.feedback_text.contentsMargins().top() + self.feedback_text.contentsMargins().bottom() + 5
         self.feedback_text.setMinimumHeight(5 * row_height + padding)
-        self.feedback_text.setPlaceholderText("✏️ 在此输入您的反馈...\n\n支持引用语法：\n  @文件名 - 引用整个文件\n  @文件名#行号 - 引用特定行\n  @文件名#起始行-结束行 - 引用行范围\n\n快捷键: Ctrl+Enter 发送")
+        self.feedback_text.setPlaceholderText(
+            "✏️ 在此输入反馈内容...\n\n"
+            "支持文件引用语法：\n"
+            "  @src/views/example/index.vue - 引用整个文件\n"
+            "  @src/views/example/index.vue#61 - 引用特定行\n"
+            "  @src/views/example/index.vue#61-70 - 引用行范围\n\n"
+            "快捷键: Ctrl+Enter 发送"
+        )
         self.feedback_text.textChanged.connect(self._on_feedback_text_changed)
         feedback_layout.addWidget(self.feedback_text)
 
@@ -928,28 +584,67 @@ class FeedbackUI(QMainWindow):
         """)
         self.reference_preview.setVisible(False)
         feedback_layout.addWidget(self.reference_preview)
-        
-        # 按钮布局：发送反馈和结束按钮
+
+        # 图片区域（精简版：直接显示在反馈区内）
+        image_bar_layout = QHBoxLayout()
+        image_bar_layout.setSpacing(8)
+
+        self.image_info_label = QLabel("")
+        self.image_info_label.setStyleSheet("font-size: 12px; color: #888;")
+        image_bar_layout.addWidget(self.image_info_label)
+
+        image_bar_layout.addStretch()
+
+        select_image_btn = QPushButton("📂 选择图片")
+        select_image_btn.setFixedHeight(28)
+        select_image_btn.setStyleSheet("""
+            QPushButton { font-size: 11px; padding: 2px 10px; }
+        """)
+        select_image_btn.clicked.connect(self._select_image_file)
+        image_bar_layout.addWidget(select_image_btn)
+
+        clear_image_btn = QPushButton("🗑️")
+        clear_image_btn.setFixedSize(28, 28)
+        clear_image_btn.setToolTip("清除所有图片")
+        clear_image_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 11px;
+                padding: 2px;
+                background-color: #5a3a3a;
+                border: 1px solid #6a4a4a;
+            }
+            QPushButton:hover { background-color: #6a4a4a; }
+        """)
+        clear_image_btn.clicked.connect(self._clear_images)
+        image_bar_layout.addWidget(clear_image_btn)
+
+        feedback_layout.addLayout(image_bar_layout)
+
+        # 图片提示
+        self.image_hint_label = QLabel("💡 在输入框中 Ctrl+V 可直接粘贴截图，也可拖放图片文件")
+        self.image_hint_label.setStyleSheet("font-size: 11px; color: #666; padding: 2px 0;")
+        feedback_layout.addWidget(self.image_hint_label)
+
+        # 按钮布局
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
-        
+
         submit_button = QPushButton("✉️ 发送反馈 (Ctrl+Enter)")
         submit_button.setObjectName("primaryButton")
         submit_button.clicked.connect(self._submit_feedback)
-        
+
         end_button = QPushButton("✓ 结束")
         end_button.clicked.connect(self._end_feedback)
-        
+
         button_layout.addStretch()
         button_layout.addWidget(end_button)
         button_layout.addWidget(submit_button)
 
         feedback_layout.addLayout(button_layout)
 
-        # Add widgets in a specific order
         layout.addWidget(self.feedback_group)
 
-        # Credits/Contact Label
+        # 底部信息
         contact_label = QLabel('💡 需要改进？联系 Fábio Ferreira <a href="https://x.com/fabiomlferreira">X.com</a> 或访问 <a href="https://dotcursorrules.com/">dotcursorrules.com</a>')
         contact_label.setOpenExternalLinks(True)
         contact_label.setAlignment(Qt.AlignCenter)
@@ -960,56 +655,45 @@ class FeedbackUI(QMainWindow):
         """设置超时计时器"""
         self.timeout_timer = QTimer()
         self.timeout_timer.timeout.connect(self._update_timeout_display)
-        self.timeout_timer.start(1000)  # 每秒更新一次
+        self.timeout_timer.start(1000)
         self._update_timeout_display()
 
     def _update_timeout_display(self):
-        """更新超时倒计时显示"""
+        """更新超时倒计时显示（仅在样式状态变化时更新样式）"""
         elapsed = time.time() - self.start_time
         remaining = max(0, self.timeout_seconds - elapsed)
-        
+
         minutes = int(remaining // 60)
         seconds = int(remaining % 60)
-        
+
         if remaining <= 0:
-            # 超时，触发自动提交
             self.timeout_timer.stop()
             self._trigger_timeout()
-        elif remaining <= 60:
-            # 最后一分钟，显示红色警告
-            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
-            self.timeout_label.setStyleSheet("""
-                font-size: 12px;
-                color: #ff6666;
-                padding: 4px 8px;
-                background-color: #4a2a2a;
-                border-radius: 4px;
-                font-weight: bold;
-            """)
+            return
+
+        # 只更新文本，样式仅在阈值变化时设置
+        self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
+
+        if remaining <= 60:
+            target_style = "danger"
         elif remaining <= 120:
-            # 两分钟内，显示橙色
-            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
-            self.timeout_label.setStyleSheet("""
-                font-size: 12px;
-                color: #ffaa66;
-                padding: 4px 8px;
-                background-color: #4a3a2a;
-                border-radius: 4px;
-            """)
+            target_style = "warning"
         else:
-            self.timeout_label.setText(f"⏱️ {minutes:02d}:{seconds:02d}")
-            self.timeout_label.setStyleSheet("""
-                font-size: 12px;
-                color: #aaa;
-                padding: 4px 8px;
-                background-color: #333;
-                border-radius: 4px;
-            """)
+            target_style = "normal"
+
+        if self._current_timeout_style != target_style:
+            self._current_timeout_style = target_style
+            style_map = {
+                "normal": self._TIMEOUT_STYLE_NORMAL,
+                "warning": self._TIMEOUT_STYLE_WARNING,
+                "danger": self._TIMEOUT_STYLE_DANGER,
+            }
+            self.timeout_label.setStyleSheet(style_map[target_style])
 
     def _reset_timeout(self):
         """重新计时"""
         self.start_time = time.time()
-        # 如果计时器已停止，重新启动
+        self._current_timeout_style = None  # 重置样式缓存
         if not self.timeout_timer.isActive():
             self.timeout_timer.start(1000)
             self.stop_timer_button.setText("⏹️ 停止")
@@ -1031,16 +715,10 @@ class FeedbackUI(QMainWindow):
     def _stop_timeout(self):
         """停止/恢复计时"""
         if self.timeout_timer.isActive():
-            # 停止计时
             self.timeout_timer.stop()
             self.timeout_label.setText("⏸️ 已暂停")
-            self.timeout_label.setStyleSheet("""
-                font-size: 12px;
-                color: #ffc;
-                padding: 4px 8px;
-                background-color: #5a4a3a;
-                border-radius: 4px;
-            """)
+            self._current_timeout_style = "paused"
+            self.timeout_label.setStyleSheet(self._TIMEOUT_STYLE_PAUSED)
             self.stop_timer_button.setText("▶️ 恢复")
             self.stop_timer_button.setStyleSheet("""
                 QPushButton {
@@ -1056,8 +734,8 @@ class FeedbackUI(QMainWindow):
                 }
             """)
         else:
-            # 恢复计时（重新开始计时）
             self.start_time = time.time()
+            self._current_timeout_style = None
             self.timeout_timer.start(1000)
             self.stop_timer_button.setText("⏹️ 停止")
             self.stop_timer_button.setStyleSheet("""
@@ -1081,125 +759,89 @@ class FeedbackUI(QMainWindow):
         self.feedback_result = FeedbackResult(
             logs="",
             interactive_feedback="[会话保持] 等待用户输入中...",
-            image_path="",
             image_paths=[],
-            context_files=[],
+            selected_options=[],
             timeout_triggered=True,
         )
         self.close()
 
-    def _adjust_window_height(self):
-        """调整窗口高度以适应内容变化（保持宽度不变）"""
-        # 保存当前宽度和高度
-        current_width = self.width()
-        current_height = self.height()
-        
-        # 先处理布局更新
-        self.centralWidget().updateGeometry()
-        QApplication.processEvents()
-        
-        # 使用 sizeHint 获取建议高度
-        hint_height = self.centralWidget().sizeHint().height() + 40  # 添加一些边距
-        
-        # 设置窗口的最小和最大高度限制
-        min_height = 300  # 最小高度
-        max_height = QApplication.primaryScreen().geometry().height() - 100  # 留出任务栏空间
-        
-        # 计算新高度
-        new_height = max(min_height, min(hint_height, max_height))
-        
-        # 如果高度变化不大，直接调整
-        if abs(new_height - current_height) < 10:
+    def _add_image_from_pixmap(self, pixmap: QPixmap, source: str):
+        """从 QPixmap 添加图片（保存临时文件并记录路径）"""
+        if pixmap.isNull():
             return
-        
-        # 使用定时器实现平滑动画效果
-        self._animate_height(current_height, new_height, current_width)
 
-    def _animate_height(self, start_height: int, end_height: int, width: int):
-        """使用动画效果平滑调整窗口高度"""
-        # 计算步数和每步的高度变化
-        steps = 8
-        height_diff = end_height - start_height
-        step_size = height_diff / steps
-        
-        # 当前步数
-        self._animation_step = 0
-        self._animation_target = end_height
-        self._animation_width = width
-        self._animation_step_size = step_size
-        self._animation_steps = steps
-        self._animation_start = start_height
-        
-        # 创建动画定时器
-        if not hasattr(self, '_height_animation_timer'):
-            from PySide6.QtCore import QTimer
-            self._height_animation_timer = QTimer()
-            self._height_animation_timer.timeout.connect(self._animate_height_step)
-        
-        # 启动动画
-        self._height_animation_timer.start(15)  # 约60fps
-
-    def _animate_height_step(self):
-        """动画步骤"""
-        self._animation_step += 1
-        
-        if self._animation_step >= self._animation_steps:
-            # 动画完成
-            self._height_animation_timer.stop()
-            self.resize(self._animation_width, self._animation_target)
-            self.setMinimumWidth(400)
-            self.setMaximumWidth(16777215)
-            return
-        
-        # 使用缓动函数计算当前高度（ease-out效果）
-        progress = self._animation_step / self._animation_steps
-        eased_progress = 1 - (1 - progress) ** 2  # 二次缓出
-        current_height = int(self._animation_start + (self._animation_target - self._animation_start) * eased_progress)
-        
-        self.resize(self._animation_width, current_height)
-
-    def _toggle_image_section(self):
-        """切换图片区域的显示/隐藏"""
-        is_visible = self.image_group.isVisible()
-        self.image_group.setVisible(not is_visible)
-        if not is_visible:
-            self.toggle_image_button.setText("➖ 图片")
+        # 确定图片路径
+        if source and os.path.exists(source):
+            image_path = source
         else:
-            self.toggle_image_button.setText("🖼️ 图片")
-        
-        # 立即保存该项目的可见性状态
-        self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
-        self.settings.endGroup()
+            # 粘贴/拖放的图片数据，保存为临时文件
+            temp_dir = tempfile.gettempdir()
+            self.temp_image_counter += 1
+            image_path = os.path.join(
+                temp_dir,
+                f"mcp_feedback_{os.getpid()}_{self.temp_image_counter}.png"
+            )
+            pixmap.save(image_path, "PNG")
 
-        # 调整窗口高度
-        self._adjust_window_height()
+        # 避免重复
+        if image_path not in self.image_paths:
+            self.image_paths.append(image_path)
+            self._update_image_display()
 
-    def _toggle_context_section(self):
-        """切换上下文引用区域的显示/隐藏"""
-        is_visible = self.context_group.isVisible()
-        self.context_group.setVisible(not is_visible)
-        if not is_visible:
-            self.toggle_context_button.setText("➖ 上下文引用")
+    def _select_image_file(self):
+        """通过文件对话框选择图片"""
+        initial_dir = self.project_directory
+        if self.current_file and os.path.exists(self.current_file):
+            if os.path.isfile(self.current_file):
+                initial_dir = os.path.dirname(self.current_file)
+            else:
+                initial_dir = self.current_file
+
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择图片（可多选）",
+            initial_dir,
+            "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
+        )
+        for file_path in files:
+            if file_path and file_path not in self.image_paths:
+                pixmap = QPixmap(file_path)
+                if not pixmap.isNull():
+                    self.image_paths.append(file_path)
+        if files:
+            self._update_image_display()
+
+    def _clear_images(self):
+        """清除所有图片"""
+        self.image_paths.clear()
+        self.temp_image_counter = 0
+        self._update_image_display()
+
+    def _update_image_display(self):
+        """更新图片状态显示"""
+        count = len(self.image_paths)
+        if count > 0:
+            names = [os.path.basename(p) for p in self.image_paths]
+            self.image_info_label.setText(f"🖼️ 已添加 {count} 张图片: {', '.join(names)}")
+            self.image_info_label.setStyleSheet("font-size: 12px; color: #4a9eff;")
+            self.image_hint_label.setVisible(False)
         else:
-            self.toggle_context_button.setText("📎 上下文引用")
-        
-        # 立即保存该项目的可见性状态
-        self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("contextSectionVisible", self.context_group.isVisible())
-        self.settings.endGroup()
+            self.image_info_label.setText("")
+            self.image_info_label.setStyleSheet("font-size: 12px; color: #888;")
+            self.image_hint_label.setVisible(True)
 
-        # 调整窗口高度
-        self._adjust_window_height()
-
-    def _select_option(self, option: str):
-        """选择一个解决方案选项，填充到输入框但不自动提交"""
-        self.feedback_text.setPlainText(f"[选择方案] {option}\n\n")
-        # 将光标移动到末尾，方便用户追加内容
-        cursor = self.feedback_text.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.feedback_text.setTextCursor(cursor)
-        self.feedback_text.setFocus()
+    def _toggle_option(self, option: str, btn: QPushButton):
+        """切换选项的选中状态（追加/移除，不覆盖输入框内容）"""
+        if option in self.selected_options:
+            # 取消选中
+            self.selected_options.remove(option)
+            btn.setStyleSheet(self._option_style_normal)
+            btn.setText(f"  {option}")
+        else:
+            # 选中
+            self.selected_options.append(option)
+            btn.setStyleSheet(self._option_style_selected)
+            btn.setText(f"✔ {option}")
 
     def _on_feedback_text_changed(self):
         """反馈文本变化时，更新引用预览"""
@@ -1207,15 +849,19 @@ class FeedbackUI(QMainWindow):
         references = parse_file_references(feedback_text, self.project_directory)
 
         if references:
-            # 显示引用预览
             preview_lines = []
             for file_path, start_line, end_line in references:
+                try:
+                    rel_path = os.path.relpath(file_path, self.project_directory).replace('\\', '/')
+                except ValueError:
+                    rel_path = os.path.basename(file_path)
+
                 if start_line is None:
-                    preview_lines.append(f"📄 {os.path.basename(file_path)}")
+                    preview_lines.append(f"📄 {rel_path}")
                 elif end_line == start_line:
-                    preview_lines.append(f"📄 {os.path.basename(file_path)}:{start_line}")
+                    preview_lines.append(f"📄 {rel_path}#{start_line}")
                 else:
-                    preview_lines.append(f"📄 {os.path.basename(file_path)}:{start_line}-{end_line}")
+                    preview_lines.append(f"📄 {rel_path}#{start_line}-{end_line}")
 
             preview_text = "检测到引用: " + ", ".join(preview_lines)
             self.reference_preview.setText(preview_text)
@@ -1223,196 +869,109 @@ class FeedbackUI(QMainWindow):
         else:
             self.reference_preview.setVisible(False)
 
-    def _get_file_dialog_initial_dir(self) -> str:
-        """获取文件对话框的初始目录
-        
-        优先使用当前编辑文件所在目录，否则使用项目目录
-        """
-        if self.current_file and os.path.exists(self.current_file):
-            # 如果是文件，返回其所在目录
-            if os.path.isfile(self.current_file):
-                return os.path.dirname(self.current_file)
-            # 如果是目录，直接返回
-            return self.current_file
-        return self.project_directory
-
-    def _add_context_file(self):
-        """添加上下文文件"""
-        # 优先使用当前文件所在目录，否则使用项目目录
-        initial_dir = self._get_file_dialog_initial_dir()
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择文件",
-            initial_dir,
-            "所有文件 (*.*)"
-        )
-        if files:
-            self._on_context_files_added(files)
-
-    def _add_context_folder(self):
-        """添加上下文文件夹"""
-        initial_dir = self._get_file_dialog_initial_dir()
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "选择文件夹",
-            initial_dir
-        )
-        if folder:
-            self._on_context_files_added([folder])
-
-    def _on_context_files_added(self, files: List[str]):
-        """上下文文件添加回调"""
-        self.context_list.setUpdatesEnabled(False)
-        try:
-            for f in files:
-                if f not in self.context_files:
-                    self.context_files.append(f)
-            self.context_list.update_display(self.context_files)
-        finally:
-            self.context_list.setUpdatesEnabled(True)
-            self.context_list.update()
-
-    def _clear_context_files(self):
-        """清除所有上下文文件"""
-        self.context_files.clear()
-        self.context_list.update_display(self.context_files)
-
     def _submit_feedback(self):
+        """提交反馈"""
         feedback_text = self.feedback_text.toPlainText().strip()
 
-        # 解析并展开文件引用（如 @文件名#行号）
-        expanded_text, referenced_files = expand_file_references(feedback_text, self.project_directory)
+        # 展开文件引用
+        expanded_text = expand_file_references(feedback_text, self.project_directory)
 
-        # 将引用的文件添加到上下文文件列表
-        all_context_files = self.context_files.copy()
-        for ref_file in referenced_files:
-            if ref_file not in all_context_files:
-                all_context_files.append(ref_file)
+        # 如果有选中的选项，追加到反馈中
+        if self.selected_options:
+            options_info = "\n".join([f"  - {opt}" for opt in self.selected_options])
+            if expanded_text:
+                expanded_text = f"[选择的方案:]\n{options_info}\n\n{expanded_text}"
+            else:
+                expanded_text = f"[选择的方案:]\n{options_info}"
 
-        # 如果有图片，在反馈文本中添加图片信息
+        # 如果有图片，追加图片路径信息
         if self.image_paths:
             images_info = "\n".join([f"  - {p}" for p in self.image_paths])
             if expanded_text:
-                expanded_text += f"\n\n[图片 ({len(self.image_paths)}张):]\n{images_info}"
+                expanded_text += f"\n\n[附加图片 ({len(self.image_paths)}张):]\n{images_info}"
             else:
-                expanded_text = f"[图片 ({len(self.image_paths)}张):]\n{images_info}"
-
-        # 如果有上下文文件，添加到反馈中
-        if all_context_files:
-            context_info = "\n".join([f"  - {f}" for f in all_context_files])
-            if expanded_text:
-                expanded_text += f"\n\n[上下文文件:]\n{context_info}"
-            else:
-                expanded_text = f"[上下文文件:]\n{context_info}"
+                expanded_text = f"[附加图片 ({len(self.image_paths)}张):]\n{images_info}"
 
         self.feedback_result = FeedbackResult(
             logs="",
             interactive_feedback=expanded_text,
-            image_path=self.image_paths[0] if self.image_paths else "",  # 保持兼容
             image_paths=self.image_paths.copy(),
-            context_files=all_context_files,
+            selected_options=self.selected_options.copy(),
             timeout_triggered=False,
         )
         self.close()
 
     def _end_feedback(self):
-        # 自动填入"结束"并提交反馈
+        """结束反馈，清理所有临时图片"""
+        self._cleanup_temp_images(keep_none=True)
         self.feedback_text.setPlainText("结束")
         self._submit_feedback()
 
-    def _select_image_file(self):
-        """选择本地图片文件（支持多选）"""
-        initial_dir = self._get_file_dialog_initial_dir()
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择图片文件（可多选）",
-            initial_dir,
-            "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)"
-        )
-        for file_path in files:
-            if file_path:
-                pixmap = QPixmap(file_path)
-                if not pixmap.isNull():
-                    self._on_image_added(pixmap, file_path)
-
-    def _paste_image(self):
-        """粘贴图片按钮处理"""
-        self.image_list._paste_from_clipboard()
-
-    def _on_image_added(self, pixmap: QPixmap, source: str):
-        """图片添加回调函数"""
-        if not pixmap.isNull():
-            # 确定图片路径
-            if source and os.path.exists(source):
-                image_path = source
-            else:
-                # 如果是粘贴的图片，保存为临时文件
-                temp_dir = tempfile.gettempdir()
-                self.temp_image_counter += 1
-                temp_image_path = os.path.join(temp_dir, f"mcp_feedback_image_{os.getpid()}_{self.temp_image_counter}.png")
-                # 禁用更新以提高保存性能
-                pixmap.save(temp_image_path, "PNG")
-                image_path = temp_image_path
-
-            # 添加到列表（避免重复）
-            if image_path not in self.image_paths:
-                self.image_list.setUpdatesEnabled(False)
-                try:
-                    self.image_paths.append(image_path)
-                    self.image_pixmaps.append(pixmap)
-                    self.image_list.update_display(self.image_paths)
-                finally:
-                    self.image_list.setUpdatesEnabled(True)
-                    self.image_list.update()
-
-    def _clear_image(self):
-        """清除所有图片"""
-        self.image_paths.clear()
-        self.image_pixmaps.clear()
-        self.temp_image_counter = 0
-        self.image_list.update_display(self.image_paths)
-
     def closeEvent(self, event):
-        # Save general UI settings for the main window (geometry, state)
         self.settings.beginGroup("MainWindow_General")
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
         self.settings.endGroup()
-
-        # Save project-specific section visibility
-        self.settings.beginGroup(self.project_group_name)
-        self.settings.setValue("imageSectionVisible", self.image_group.isVisible())
-        self.settings.setValue("contextSectionVisible", self.context_group.isVisible())
-        self.settings.endGroup()
-
         super().closeEvent(event)
+
+    def _cleanup_temp_images(self, keep_none: bool = False):
+        """清理临时图片文件
+
+        参数:
+            keep_none: 为 True 时清除所有临时图片，为 False 时保留提交中引用的
+        """
+        temp_dir = tempfile.gettempdir()
+
+        # 确定需要保留的路径
+        keep_paths = set()
+        if not keep_none and self.feedback_result and self.feedback_result.get("image_paths"):
+            keep_paths = set(self.feedback_result["image_paths"])
+
+        # 清除所有 mcp_feedback_ 临时图片（包括历史会话的）
+        try:
+            for filename in os.listdir(temp_dir):
+                if filename.startswith("mcp_feedback_") and filename.endswith(".png"):
+                    full_path = os.path.join(temp_dir, filename)
+                    if full_path not in keep_paths:
+                        try:
+                            os.remove(full_path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
 
     def run(self) -> FeedbackResult:
         self.show()
         QApplication.instance().exec()
 
         if not self.feedback_result:
-            return FeedbackResult(logs="", interactive_feedback="", image_path="", image_paths=[], context_files=[], timeout_triggered=False)
+            return FeedbackResult(
+                logs="",
+                interactive_feedback="",
+                image_paths=[],
+                selected_options=[],
+                timeout_triggered=False,
+            )
 
         return self.feedback_result
 
+
 def get_project_settings_group(project_dir: str) -> str:
-    # Create a safe, unique group name from the project directory path
-    # Using only the last component + hash of full path to keep it somewhat readable but unique
     basename = os.path.basename(os.path.normpath(project_dir))
     full_hash = hashlib.md5(project_dir.encode('utf-8')).hexdigest()[:8]
     return f"{basename}_{full_hash}"
 
+
 def feedback_ui(project_directory: str, prompt: str, output_file: Optional[str] = None, current_file: Optional[str] = None, timeout_seconds: int = 600, options: Optional[List[str]] = None) -> Optional[FeedbackResult]:
     """启动反馈UI界面
-    
+
     参数:
         project_directory: 项目目录路径
         prompt: 提示信息
         output_file: 输出文件路径
-        current_file: 当前编辑的文件路径（用于文件选择器初始目录）
-        timeout_seconds: 超时时间（秒），超时后自动提交以保持会话活跃
-        options: 可选的解决方案列表，供用户快速选择
+        current_file: 当前编辑的文件路径
+        timeout_seconds: 超时时间（秒）
+        options: 可选的解决方案列表
     """
     app = QApplication.instance() or QApplication()
     app.setPalette(get_dark_mode_palette(app))
@@ -1421,26 +980,24 @@ def feedback_ui(project_directory: str, prompt: str, output_file: Optional[str] 
     result = ui.run()
 
     if output_file and result:
-        # Ensure the directory exists
         os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
-        # Save the result to the output file
         with open(output_file, "w") as f:
             json.dump(result, f)
         return None
 
     return result
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="运行反馈界面")
-    parser.add_argument("--project-directory", default=os.getcwd(), help="运行命令的项目目录")
+    parser.add_argument("--project-directory", default=os.getcwd(), help="项目目录路径")
     parser.add_argument("--prompt", default="我已经实现了您请求的更改。", help="显示给用户的提示")
     parser.add_argument("--output-file", help="保存反馈结果为 JSON 的路径")
-    parser.add_argument("--current-file", help="当前编辑的文件路径（用于文件选择器）")
+    parser.add_argument("--current-file", help="当前编辑的文件路径")
     parser.add_argument("--timeout", type=int, default=600, help="超时时间（秒），默认600秒")
     parser.add_argument("--options", help="解决方案选项列表（JSON格式）")
     args = parser.parse_args()
 
-    # 解析选项
     options = None
     if args.options:
         try:
@@ -1450,6 +1007,5 @@ if __name__ == "__main__":
 
     result = feedback_ui(args.project_directory, args.prompt, args.output_file, args.current_file, args.timeout, options)
     if result:
-        print(f"\n收集的日志: \n{result['logs']}")
         print(f"\n收到的反馈:\n{result['interactive_feedback']}")
     sys.exit(0)

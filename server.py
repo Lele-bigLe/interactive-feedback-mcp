@@ -22,11 +22,11 @@ mcp = FastMCP("Interactive Feedback MCP", log_level="ERROR")
 def launch_feedback_ui(project_directory: str, summary: str, current_file: Optional[str] = None, timeout_seconds: int = INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS, options: Optional[List[str]] = None) -> dict[str, str]:
     """
     启动反馈UI界面
-    
+
     参数:
         project_directory: 项目目录路径
-        summary: 摘要说明
-        current_file: 当前编辑文件的路径（用于文件选择器）
+        summary: 简短的变更摘要说明
+        current_file: 当前编辑文件的路径
         timeout_seconds: 超时时间（秒），超时后自动重新调用以保持会话活跃
         options: 可选的解决方案列表，供用户快速选择
     """
@@ -88,13 +88,13 @@ def first_line(text: str) -> str:
 
 @mcp.tool()
 def interactive_feedback(
-    project_directory: Annotated[str, Field(description="Full path to the project directory")],
-    summary: Annotated[str, Field(description="Short, one-line summary of the changes")],
-    current_file: Annotated[Optional[str], Field(description="Current file being edited, used for file dialog initial directory")] = None,
-    options: Annotated[Optional[List], Field(description="Optional list of solution options for user to choose from, e.g. ['Option A: ...', 'Option B: ...']")] = None,
+    project_directory: Annotated[str, Field(description="项目目录的完整路径")],
+    summary: Annotated[str, Field(description="简短的变更摘要说明（一行）")],
+    current_file: Annotated[Optional[str], Field(description="当前正在编辑的文件路径")] = None,
+    options: Annotated[Optional[List], Field(description="可选的解决方案列表，供用户快速选择，例如 ['方案A: ...', '方案B: ...']")] = None,
 ) -> Dict[str, str]:
     """
-    Request interactive feedback for a given project directory and summary.
+    请求用户对当前变更进行交互式反馈。
 
     此工具会启动一个交互式反馈界面，等待用户输入。如果用户在超时时间内未响应，
     工具会自动返回一个特殊标记，提示需要重新调用以保持会话活跃。
@@ -114,7 +114,7 @@ def interactive_feedback(
 @mcp.tool()
 def health_check() -> Dict[str, str]:
     """
-    健康检查工具 - 验证 MCP 服务器和依赖是否正常工作
+    健康检查 - 验证 MCP 服务器和依赖是否正常运行。
     """
     checks = {}
 
